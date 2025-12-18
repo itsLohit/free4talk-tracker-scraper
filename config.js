@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-// Parse DATABASE_URL from Render (format: postgres://user:pass@host:port/dbname)
+// Parse DATABASE_URL from Render or use individual env vars
 function parseDatabaseUrl(url) {
   if (!url) {
     // Fallback to individual env vars for local development
@@ -13,17 +13,22 @@ function parseDatabaseUrl(url) {
     };
   }
 
-  const match = url.match(/postgres:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/(.+)/);
+  // Handle both postgres:// and postgresql:// formats
+  const urlPattern = /^postgres(?:ql)?:\/\/([^:]+):([^@]+)@([^:\/]+)(?::(\d+))?\/(.+?)(?:\?.*)?$/;
+  const match = url.match(urlPattern);
+  
   if (match) {
     return {
-      user: match[1],
-      password: match[2],
+      user: decodeURIComponent(match[1]),
+      password: decodeURIComponent(match[2]),
       host: match[3],
-      port: parseInt(match[4]),
-      database: match[5],
+      port: parseInt(match[4] || '5432'),
+      database: match[5].split('?')[0], // Remove query params
+      ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
     };
   }
 
+  console.error('DATABASE_URL format not recognized:', url);
   throw new Error('Invalid DATABASE_URL format');
 }
 
