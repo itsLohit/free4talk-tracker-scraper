@@ -39,10 +39,16 @@ async function fetchAndProcessRooms() {
   let browser;
   
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--disable-blink-features=AutomationControlled']
-    });
+    const browser = await chromium.launch({
+  headless: true,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu'
+  ]
+});
+
 
     const context = await browser.newContext({
       viewport: { width: 1920, height: 1080 },
