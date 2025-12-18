@@ -39,16 +39,17 @@ async function fetchAndProcessRooms() {
   let browser;
   
   try {
-    const browser = await chromium.launch({
-  headless: true,
-  args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu'
-  ]
-});
-
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',              // ✅ Required for Docker
+        '--disable-setuid-sandbox',  // ✅ Required for Docker
+        '--disable-dev-shm-usage',   // ✅ Prevents memory issues
+        '--disable-gpu'              // ✅ Not needed in cloud
+      ]
+    });
+    
 
     const context = await browser.newContext({
       viewport: { width: 1920, height: 1080 },

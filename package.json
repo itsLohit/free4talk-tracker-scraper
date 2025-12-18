@@ -1,15 +1,23 @@
 {
   "name": "free4talk-tracker-scraper",
   "version": "1.0.0",
+  "description": "Free4Talk room and user tracker",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "postinstall": "npx playwright install chromium"
+    "dev": "nodemon index.js",
+    "test": "node index.js --once"
   },
+  "keywords": ["free4talk", "tracker", "scraper"],
+  "author": "Lohit T",
+  "license": "MIT",
   "dependencies": {
-    "playwright": "^1.40.0",
     "cheerio": "^1.0.0-rc.12",
+    "dotenv": "^16.3.1",
     "pg": "^8.11.3",
-    "dotenv": "^16.3.1"
+    "playwright": "^1.40.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
   }
 }

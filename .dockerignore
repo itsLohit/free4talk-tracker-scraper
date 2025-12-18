@@ -1,0 +1,7 @@
+node_modules
+npm-debug.log
+.env
+.git
+debug-page.html
+test_data.sql
+schema.sql
