@@ -1,11 +1,9 @@
 require('dotenv').config();
 
-/**
- * Parse DATABASE_URL with proper SSL support for cloud databases
- */
+// Parse DATABASE_URL properly with SSL support
 function parseDatabaseUrl(url) {
   if (!url) {
-    // Fallback for local development
+    // Fallback to individual env vars for local development
     return {
       host: process.env.DB_HOST || 'localhost',
       port: parseInt(process.env.DB_PORT || '5432'),
@@ -26,9 +24,9 @@ function parseDatabaseUrl(url) {
       host: match[3],
       port: parseInt(match[4]),
       database: match[5],
-      // SSL configuration for cloud databases (Aiven, etc.)
+      // Always use SSL for cloud databases
       ssl: {
-        rejectUnauthorized: false
+        rejectUnauthorized: false  // Aiven uses self-signed certs
       }
     };
   }
@@ -40,11 +38,6 @@ module.exports = {
   db: parseDatabaseUrl(process.env.DATABASE_URL),
   scraper: {
     url: 'https://free4talk.com/',
-    interval: 3000, // 3 seconds between cycles (optimized)
-    scrollWait: 200, // milliseconds to wait after each scroll
-    initialWait: 300, // milliseconds to wait for initial page load
-    maxScrolls: 50, // maximum number of scrolls
-    scrollsWithoutNew: 3, // stop after N scrolls with no new rooms
-    batchSize: 30, // process N rooms in parallel
+    interval: 5000, // 60 seconds (optimized for Railway)
   },
 };
