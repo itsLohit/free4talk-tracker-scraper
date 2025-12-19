@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-// Parse DATABASE_URL from Render (format: postgres://user:pass@host:port/dbname)
+// Parse DATABASE_URL properly with SSL support
 function parseDatabaseUrl(url) {
   if (!url) {
     // Fallback to individual env vars for local development
@@ -13,7 +13,10 @@ function parseDatabaseUrl(url) {
     };
   }
 
-  const match = url.match(/postgres:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/(.+)/);
+  // Remove query parameters before parsing
+  const [baseUrl, queryString] = url.split('?');
+  
+  const match = baseUrl.match(/postgres:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/(.+)/);
   if (match) {
     return {
       user: match[1],
@@ -21,6 +24,10 @@ function parseDatabaseUrl(url) {
       host: match[3],
       port: parseInt(match[4]),
       database: match[5],
+      // Always use SSL for cloud databases
+      ssl: {
+        rejectUnauthorized: false  // Aiven uses self-signed certs
+      }
     };
   }
 
@@ -31,6 +38,6 @@ module.exports = {
   db: parseDatabaseUrl(process.env.DATABASE_URL),
   scraper: {
     url: 'https://free4talk.com/',
-    interval: 30000, // 30 seconds
+    interval: 60000, // 60 seconds (optimized for Railway)
   },
 };
