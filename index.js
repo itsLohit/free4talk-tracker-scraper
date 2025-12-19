@@ -33,15 +33,24 @@ function wait(ms) {
 /**
  * Fetch and process rooms while scrolling (memory efficient)
  */
+/**
+ * Fetch and process rooms while scrolling (ULTRA-OPTIMIZED)
+ */
 async function fetchAndProcessRooms() {
   const { chromium } = require('playwright');
   const cheerio = require('cheerio');
   let browser;
-  
+
   try {
     browser = await chromium.launch({
       headless: true,
-      args: ['--disable-blink-features=AutomationControlled']
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
     });
 
     const context = await browser.newContext({
@@ -50,34 +59,31 @@ async function fetchAndProcessRooms() {
     });
 
     const page = await context.newPage();
-    
     console.log(`🌐 Navigating to ${config.scraper.url}...`);
-    
-    await page.goto(config.scraper.url, { 
+
+    await page.goto(config.scraper.url, {
       waitUntil: 'networkidle',
-      timeout: 60000 
+      timeout: 60000
     });
 
     console.log('⏳ Waiting for content to load...');
     await page.waitForSelector('.group-list', { timeout: 15000 });
-    await wait(3000);
+    await wait(500);
 
-    console.log('📜 Scrolling and processing rooms...\n');
-    
+    console.log('📜 Scrolling and collecting rooms...\n');
+
     const processedRoomIds = new Set();
     let scrollsWithoutNewRooms = 0;
-    const maxScrollsWithoutNew = 5;
-    let totalJoins = 0;
-    let totalLeaves = 0;
-    
+    const maxScrollsWithoutNew = 3;
+    const allRoomsData = []; // Collect all rooms first
+
+    // PHASE 1: Fast scrolling and HTML collection (no DB calls)
     for (let i = 0; i < 50; i++) {
-      // Extract HTML of visible rooms
       const roomsHtml = await page.evaluate(() => {
         const rooms = [];
         document.querySelectorAll('.group-item:not(.fake)').forEach(roomEl => {
           const idElement = roomEl.querySelector('[id^="group-"]');
           const roomId = idElement ? idElement.id.replace('group-', '') : null;
-          
           if (roomId && !roomId.includes('fake')) {
             rooms.push({
               id: roomId,
@@ -88,26 +94,24 @@ async function fetchAndProcessRooms() {
         return rooms;
       });
 
-      // Parse and process NEW rooms only
       let newRoomsCount = 0;
-      const roomsToProcess = [];
-      
+
       for (const { id, html } of roomsHtml) {
         if (!processedRoomIds.has(id)) {
           processedRoomIds.add(id);
-          
           const $ = cheerio.load(html);
           const $room = $('.group-item').first();
-          
+
           const language = $room.find('.sc-kvZOFW').text().trim() || 'Unknown';
           const rawSkillLevel = $room.find('.sc-hqyNC').text().trim() || 'Any Level';
           const topic = $room.find('.sc-jbKcbu .notranslate').text().trim() || 'Anything';
-          
+
           const participants = [];
           $room.find('.client-item').each((idx, clientEl) => {
             const $client = $(clientEl);
-            const isEmptySlot = $client.find('.blind').text().includes('Empty Slot') || 
-                               $client.find('button[disabled]').length > 0;
+            const isEmptySlot = $client.find('.blind').text().includes('Empty Slot') ||
+              $client.find('button[disabled]').length > 0;
+
             if (isEmptySlot) return;
 
             const username = $client.find('button[aria-label]').attr('aria-label');
@@ -123,53 +127,43 @@ async function fetchAndProcessRooms() {
               position: idx + 1
             });
           });
-          
-          roomsToProcess.push({
+
+          // Store for later batch processing
+          allRoomsData.push({
             room_id: id,
             language,
             skill_level: rawSkillLevel,
             topic,
             participants
           });
-          
+
           newRoomsCount++;
         }
       }
 
-      // Process new rooms and get join/leave counts
-      let batchJoins = 0;
-      let batchLeaves = 0;
-      
-      if (roomsToProcess.length > 0) {
-        const { joinCount, leaveCount } = await processRoomsData(roomsToProcess);
-        batchJoins = joinCount;
-        batchLeaves = leaveCount;
-        totalJoins += joinCount;
-        totalLeaves += leaveCount;
-      }
-
-      // Clean logging: only show summary
       const statusIcon = newRoomsCount > 0 ? '✅' : '⏸️';
-      console.log(`   ${statusIcon} Scroll ${i + 1}: ${processedRoomIds.size} total rooms (+${newRoomsCount} new) | +${batchJoins} joins, -${batchLeaves} leaves`);
+      console.log(`  ${statusIcon} Scroll ${i + 1}: ${processedRoomIds.size} total rooms (+${newRoomsCount} new)`);
 
-      // Check if done
       if (newRoomsCount === 0) {
         scrollsWithoutNewRooms++;
         if (scrollsWithoutNewRooms >= maxScrollsWithoutNew) {
-          console.log(`\n✅ Completed scrolling. Total: ${processedRoomIds.size} rooms\n`);
+          console.log(`\n✅ Collected all ${processedRoomIds.size} rooms\n`);
           break;
         }
       } else {
         scrollsWithoutNewRooms = 0;
       }
 
-      // Scroll
       await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5));
-      await wait(2000);
+      await wait(300); // Even faster scroll
     }
 
     await browser.close();
-    
+
+    // PHASE 2: Batch process all collected data
+    console.log('💾 Processing data...');
+    const { totalJoins, totalLeaves } = await processBatchRooms(allRoomsData);
+
     return {
       roomCount: processedRoomIds.size,
       totalJoins,
@@ -180,6 +174,78 @@ async function fetchAndProcessRooms() {
     if (browser) await browser.close();
     throw error;
   }
+}
+
+/**
+ * Process all rooms in ONE batch (much faster)
+ */
+async function processBatchRooms(allRoomsData) {
+  console.log(`  Processing ${allRoomsData.length} rooms in batch...`);
+  
+  let totalJoins = 0;
+  let totalLeaves = 0;
+
+  // Process in parallel batches of 20 rooms
+  const batchSize = 20;
+  for (let i = 0; i < allRoomsData.length; i += batchSize) {
+    const batch = allRoomsData.slice(i, i + batchSize);
+    
+    const results = await Promise.all(
+      batch.map(async (roomData) => {
+        try {
+          const skillLevelMap = {
+            'beginner': 'Beginner',
+            'intermediate': 'Intermediate',
+            'upper intermediate': 'Advanced',
+            'advanced': 'Advanced',
+            'upper advanced': 'Upper Advanced',
+            'any level': 'Any Level',
+            'all levels': 'Any Level',
+          };
+          const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
+
+          await db.upsertRoom({
+            room_id: roomData.room_id,
+            language: roomData.language,
+            skill_level,
+            topic: roomData.topic,
+            max_capacity: -1,
+            is_active: true,
+            is_full: false,
+            is_empty: roomData.participants.length === 0,
+            allows_unlimited: true,
+            mic_allowed: true,
+            mic_required: false,
+          });
+
+          const participantsData = roomData.participants.map(p => ({
+            user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
+            username: p.username,
+            user_avatar: null,
+            followers_count: p.followers,
+            verification_status: 'UNVERIFIED',
+            position: p.position,
+          }));
+          roomData.participants = participantsData;
+
+          const { joined, left } = await tracker.processRoom(roomData);
+          return { joined, left };
+        } catch (error) {
+          console.error(`  ❌ Error: ${roomData.room_id}: ${error.message}`);
+          return { joined: 0, left: 0 };
+        }
+      })
+    );
+
+    results.forEach(r => {
+      totalJoins += r.joined;
+      totalLeaves += r.left;
+    });
+
+    console.log(`  ✅ Batch ${Math.floor(i / batchSize) + 1}: +${results.reduce((s, r) => s + r.joined, 0)} joins, -${results.reduce((s, r) => s + r.left, 0)} leaves`);
+  }
+
+  return { totalJoins, totalLeaves };
 }
 
 
