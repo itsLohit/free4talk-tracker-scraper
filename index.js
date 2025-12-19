@@ -1,72 +1,106 @@
-const express = require('express');
 const { chromium } = require('playwright');
 const db = require('./db');
-const { parseSnapshot } = require('./parser');
-const { TARGET_URL, PORT } = require('./config');
+const SessionTracker = require('./tracker');
+const config = require('./config');
 
-const app = express();
-const port = process.env.PORT || 8080;
+const tracker = new SessionTracker();
 
-// === API Server (Keep this, it's good!) ===
-app.get('/api/rooms', async (req, res) => {
-    try {
-        const result = await db.pool.query('SELECT * FROM rooms WHERE is_active = true ORDER BY peak_concurrent_users DESC');
-        res.json(result.rows);
-    } catch (e) { res.status(500).json({error: e.message}); }
-});
+async function startSmartScraper() {
+    console.log('🚀 Starting Smart Network Interceptor...');
 
-app.listen(port, () => console.log(`🚀 API Server running on port ${port}`));
+    const browser = await chromium.launch({ 
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+    });
 
+    const context = await browser.newContext();
+    const page = await context.newPage();
 
-// === The Scraper (Fixed URL) ===
-async function startScraper() {
-    let browser = null;
-    while (true) {
-        try {
-            console.log("🕸️ Launching Scraper...");
-            browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-            const page = await browser.newPage();
+    await tracker.initialize();
 
-            // Intercept the CORRECT Network Request
-            page.on('response', async (response) => {
-                const url = response.url();
-                
-                // ✅ THIS WAS THE FIX: The correct API URL
-                if (url.includes('/sync/get/free4talk/groups/') && response.status() === 200) {
-                    try {
-                        const json = await response.json();
-                        // Free4Talk wraps data in { success: true, data: { ... } }
-                        if (json.success && json.data) {
-                            console.log(`⚡ Intercepted Data! Syncing...`);
-                            
-                            const { rooms } = parseSnapshot(json.data); // Pass the inner 'data' object
-                            
-                            // Save to DB
-                            for (const room of rooms) {
-                                await db.upsertRoom(room);
-                                await db.syncRoomSessions(room.room_id, room.users);
-                            }
-                            console.log(`✅ Synced ${rooms.length} active rooms.`);
-                        }
-                    } catch (err) {
-                        console.error("⚠️ Parse Error:", err.message);
-                    }
+    let latestGroups = null;
+
+    page.on('response', async response => {
+        const url = response.url();
+        if (url.includes('/sync/get/free4talk/groups/')) {
+            try {
+                const json = await response.json();
+                if (json.success && json.data) {
+                    console.log(`⚡ INTERCEPTED: ${Object.keys(json.data).length} groups from network!`);
+                    latestGroups = json.data;
                 }
-            });
-
-            await page.goto(TARGET_URL, { waitUntil: 'networkidle', timeout: 60000 });
-            console.log("✅ Connected. Waiting for data stream...");
-
-            // Keep browser open forever
-            await new Promise(() => {});
-
-        } catch (err) {
-            console.error("❌ Scraper Crash:", err.message);
-            if (browser) await browser.close();
-            console.log("🔄 Restarting in 10s...");
-            await new Promise(r => setTimeout(r, 10000));
+            } catch (err) {}
         }
+    });
+
+    console.log('🌐 Navigating to Free4Talk...');
+    await page.goto('https://www.free4talk.com/', { waitUntil: 'networkidle' });
+
+    async function loop() {
+        console.log(`\n🔄 Cycle: ${new Date().toLocaleTimeString()}`);
+
+        if (latestGroups) {
+            console.log('💾 Processing captured data...');
+            await processApiData(latestGroups);
+            latestGroups = null;
+        } else {
+            console.log('⚠️ No new data yet. Waiting...');
+        }
+
+        await new Promise(r => setTimeout(r, config.scraper.interval || 10000));
+        loop();
     }
+
+    loop();
 }
 
-startScraper();
+async function processApiData(apiGroups) {
+    const processedRooms = [];
+
+    // 🛠️ MAPPING FIX: Map API values to Database Allowed Values
+    const skillMap = {
+        'Beginner': 'Beginner',
+        'Upper Beginner': 'Beginner',         // Map Upper Beginner -> Beginner
+        'Intermediate': 'Intermediate',
+        'Upper Intermediate': 'Intermediate', // Map Upper Intermediate -> Intermediate
+        'Advanced': 'Advanced',
+        'Upper Advanced': 'Advanced',         // Map Upper Advanced -> Advanced
+        'Any Level': 'Any Level'
+    };
+
+    for (const [id, group] of Object.entries(apiGroups)) {
+        try {
+            // Apply the mapping!
+            const cleanSkill = skillMap[group.level] || 'Any Level';
+
+            const roomData = {
+                room_id: group.id,
+                language: group.language,
+                topic: group.topic,
+                skill_level: cleanSkill, // Use the CLEAN skill level
+                is_active: true,
+                max_capacity: group.maxPeople
+            };
+
+            await db.upsertRoom(roomData);
+
+            const participants = group.clients.map((c, i) => ({
+                user_id: c.id,
+                username: c.name,
+                position: i
+            }));
+
+            await tracker.processRoom({
+                room_id: group.id,
+                participants: participants
+            });
+
+            processedRooms.push(group.id);
+        } catch(e) { 
+            console.error(`❌ Error processing room ${group.id}:`, e.message); 
+        }
+    }
+    console.log(`✅ Processed ${processedRooms.length} rooms`);
+}
+
+startSmartScraper();
