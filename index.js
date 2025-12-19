@@ -1,12 +1,11 @@
 const { chromium } = require('playwright');
 const config = require('./config');
-const { parseRooms, parseLanguageStats } = require('./parser');
 const SessionTracker = require('./tracker');
 const db = require('./db');
-
 const http = require('http');
+const cheerio = require('cheerio');
 
-// Health check endpoint to keep Render awake
+// Health check server for Railway
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -19,9 +18,11 @@ server.listen(PORT, () => {
   console.log(`Health check server running on port ${PORT}`);
 });
 
-
-// Global tracker instance
+// Global instances (reused across cycles)
 const tracker = new SessionTracker();
+let globalBrowser = null;
+let globalContext = null;
+let globalPage = null;
 
 /**
  * Helper: Wait for specified milliseconds
@@ -31,51 +32,66 @@ function wait(ms) {
 }
 
 /**
- * Fetch and process rooms while scrolling (ULTRA-OPTIMIZED)
+ * Get or create browser instance (reused for performance)
+ */
+async function getBrowser() {
+  try {
+    if (!globalBrowser || !globalBrowser.isConnected()) {
+      console.log('🌐 Launching browser...');
+      globalBrowser = await chromium.launch({
+        headless: true,
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu'
+        ]
+      });
+
+      globalContext = await globalBrowser.newContext({
+        viewport: { width: 1920, height: 1080 },
+        userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      });
+
+      globalPage = await globalContext.newPage();
+    }
+    return { browser: globalBrowser, page: globalPage };
+  } catch (error) {
+    // Reset on error
+    globalBrowser = null;
+    globalContext = null;
+    globalPage = null;
+    throw error;
+  }
+}
+
+/**
+ * Fetch and collect all room data (PHASE 1: Fast Scrolling)
  */
 async function fetchAndProcessRooms() {
-  const { chromium } = require('playwright');
-  const cheerio = require('cheerio');
-  let browser;
-
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
-    });
+    const { page } = await getBrowser();
 
-    const context = await browser.newContext({
-      viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    });
-
-    const page = await context.newPage();
     console.log(`🌐 Navigating to ${config.scraper.url}...`);
-
     await page.goto(config.scraper.url, {
-      waitUntil: 'networkidle',
-      timeout: 60000
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
     });
 
     console.log('⏳ Waiting for content to load...');
     await page.waitForSelector('.group-list', { timeout: 15000 });
-    await wait(500);
+    await wait(config.scraper.initialWait);
 
     console.log('📜 Scrolling and collecting rooms...\n');
 
     const processedRoomIds = new Set();
     let scrollsWithoutNewRooms = 0;
-    const maxScrollsWithoutNew = 3;
-    const allRoomsData = []; // Collect all rooms first
+    const allRoomsData = [];
 
-    // PHASE 1: Fast scrolling and HTML collection (no DB calls)
-    for (let i = 0; i < 50; i++) {
+    // PHASE 1: Fast scrolling - collect HTML only (no DB operations)
+    for (let i = 0; i < config.scraper.maxScrolls; i++) {
+      // Extract room HTML from page
       const roomsHtml = await page.evaluate(() => {
         const rooms = [];
         document.querySelectorAll('.group-item:not(.fake)').forEach(roomEl => {
@@ -93,9 +109,11 @@ async function fetchAndProcessRooms() {
 
       let newRoomsCount = 0;
 
+      // Parse HTML and collect room data
       for (const { id, html } of roomsHtml) {
         if (!processedRoomIds.has(id)) {
           processedRoomIds.add(id);
+          
           const $ = cheerio.load(html);
           const $room = $('.group-item').first();
 
@@ -125,7 +143,6 @@ async function fetchAndProcessRooms() {
             });
           });
 
-          // Store for later batch processing
           allRoomsData.push({
             room_id: id,
             language,
@@ -141,9 +158,10 @@ async function fetchAndProcessRooms() {
       const statusIcon = newRoomsCount > 0 ? '✅' : '⏸️';
       console.log(`  ${statusIcon} Scroll ${i + 1}: ${processedRoomIds.size} total rooms (+${newRoomsCount} new)`);
 
+      // Check if we should stop
       if (newRoomsCount === 0) {
         scrollsWithoutNewRooms++;
-        if (scrollsWithoutNewRooms >= maxScrollsWithoutNew) {
+        if (scrollsWithoutNewRooms >= config.scraper.scrollsWithoutNew) {
           console.log(`\n✅ Collected all ${processedRoomIds.size} rooms\n`);
           break;
         }
@@ -151,13 +169,12 @@ async function fetchAndProcessRooms() {
         scrollsWithoutNewRooms = 0;
       }
 
+      // Scroll to load more rooms
       await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5));
-      await wait(300); // Even faster scroll
+      await wait(config.scraper.scrollWait);
     }
 
-    await browser.close();
-
-    // PHASE 2: Batch process all collected data
+    // PHASE 2: Process all collected data in batches
     console.log('💾 Processing data...');
     const { totalJoins, totalLeaves } = await processBatchRooms(allRoomsData);
 
@@ -168,275 +185,102 @@ async function fetchAndProcessRooms() {
     };
 
   } catch (error) {
-    if (browser) await browser.close();
+    console.error('❌ Error in fetchAndProcessRooms:', error.message);
+    // Reset browser on error
+    if (globalBrowser) {
+      try { await globalBrowser.close(); } catch (e) {}
+      globalBrowser = null;
+      globalContext = null;
+      globalPage = null;
+    }
     throw error;
   }
 }
 
 /**
- * Process all rooms in ONE batch (much faster)
+ * Process all rooms in batches (PHASE 2: Database Operations)
  */
 async function processBatchRooms(allRoomsData) {
-  console.log(`  Processing ${allRoomsData.length} rooms in batch...`);
+  console.log(`  Processing ${allRoomsData.length} rooms in batches...\n`);
   
   let totalJoins = 0;
   let totalLeaves = 0;
 
-  // Process in parallel batches of 20 rooms
-  const batchSize = 20;
+  const batchSize = config.scraper.batchSize;
+  
   for (let i = 0; i < allRoomsData.length; i += batchSize) {
     const batch = allRoomsData.slice(i, i + batchSize);
+    const batchNum = Math.floor(i / batchSize) + 1;
     
-    const results = await Promise.all(
-      batch.map(async (roomData) => {
-        try {
-          const skillLevelMap = {
-            'beginner': 'Beginner',
-            'intermediate': 'Intermediate',
-            'upper intermediate': 'Advanced',
-            'advanced': 'Advanced',
-            'upper advanced': 'Upper Advanced',
-            'any level': 'Any Level',
-            'all levels': 'Any Level',
-          };
-          const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
+    try {
+      // Process batch in parallel
+      const results = await Promise.all(
+        batch.map(async (roomData) => {
+          try {
+            // Normalize skill level
+            const skillLevelMap = {
+              'beginner': 'Beginner',
+              'intermediate': 'Intermediate',
+              'upper intermediate': 'Advanced',
+              'advanced': 'Advanced',
+              'upper advanced': 'Upper Advanced',
+              'any level': 'Any Level',
+              'all levels': 'Any Level',
+            };
+            const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
 
-          await db.upsertRoom({
-            room_id: roomData.room_id,
-            language: roomData.language,
-            skill_level,
-            topic: roomData.topic,
-            max_capacity: -1,
-            is_active: true,
-            is_full: false,
-            is_empty: roomData.participants.length === 0,
-            allows_unlimited: true,
-            mic_allowed: true,
-            mic_required: false,
-          });
+            // Upsert room
+            await db.upsertRoom({
+              room_id: roomData.room_id,
+              language: roomData.language,
+              skill_level,
+              topic: roomData.topic,
+              max_capacity: -1,
+              is_active: true,
+              is_full: false,
+              is_empty: roomData.participants.length === 0,
+              allows_unlimited: true,
+              mic_allowed: true,
+              mic_required: false,
+            });
 
-          const participantsData = roomData.participants.map(p => ({
-            user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
-            username: p.username,
-            user_avatar: null,
-            followers_count: p.followers,
-            verification_status: 'UNVERIFIED',
-            position: p.position,
-          }));
-          roomData.participants = participantsData;
+            // Process participants
+            const participantsData = roomData.participants.map(p => ({
+              user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
+              username: p.username,
+              user_avatar: null,
+              followers_count: p.followers,
+              verification_status: 'UNVERIFIED',
+              position: p.position,
+            }));
+            roomData.participants = participantsData;
 
-          const { joined, left } = await tracker.processRoom(roomData);
-          return { joined, left };
-        } catch (error) {
-          console.error(`  ❌ Error: ${roomData.room_id}: ${error.message}`);
-          return { joined: 0, left: 0 };
-        }
-      })
-    );
+            // Track sessions
+            const { joined, left } = await tracker.processRoom(roomData);
+            return { joined, left, success: true };
 
-    results.forEach(r => {
-      totalJoins += r.joined;
-      totalLeaves += r.left;
-    });
+          } catch (error) {
+            console.error(`  ⚠️  Error processing room ${roomData.room_id}:`, error.message);
+            return { joined: 0, left: 0, success: false };
+          }
+        })
+      );
 
-    console.log(`  ✅ Batch ${Math.floor(i / batchSize) + 1}: +${results.reduce((s, r) => s + r.joined, 0)} joins, -${results.reduce((s, r) => s + r.left, 0)} leaves`);
+      // Sum up results
+      const batchJoins = results.reduce((sum, r) => sum + r.joined, 0);
+      const batchLeaves = results.reduce((sum, r) => sum + r.left, 0);
+      totalJoins += batchJoins;
+      totalLeaves += batchLeaves;
+
+      console.log(`  ✅ Batch ${batchNum}: +${batchJoins} joins, -${batchLeaves} leaves`);
+
+    } catch (error) {
+      console.error(`  ❌ Batch ${batchNum} failed:`, error.message);
+    }
   }
 
   return { totalJoins, totalLeaves };
 }
-
-
-
-/**
- * Process room data (OPTIMIZED - parallel processing)
- */
-async function processRoomsData(rooms) {
-  let joinCount = 0;
-  let leaveCount = 0;
-
-  // Process ALL rooms in parallel instead of one-by-one
-  const results = await Promise.all(
-    rooms.map(async (roomData) => {
-      try {
-        // Normalize skill level
-        const skillLevelMap = {
-          'beginner': 'Beginner',
-          'intermediate': 'Intermediate',
-          'upper intermediate': 'Advanced',
-          'advanced': 'Advanced',
-          'upper advanced': 'Upper Advanced',
-          'any level': 'Any Level',
-          'all levels': 'Any Level',
-        };
-        const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
-
-        // Upsert room and process participants in parallel
-        await db.upsertRoom({
-          room_id: roomData.room_id,
-          language: roomData.language,
-          skill_level,
-          topic: roomData.topic,
-          max_capacity: -1,
-          is_active: true,
-          is_full: false,
-          is_empty: roomData.participants.length === 0,
-          allows_unlimited: true,
-          mic_allowed: true,
-          mic_required: false,
-        });
-
-        // Process participants
-        const participantsData = roomData.participants.map(p => ({
-          user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
-          username: p.username,
-          user_avatar: null,
-          followers_count: p.followers,
-          verification_status: 'UNVERIFIED',
-          position: p.position,
-        }));
-        roomData.participants = participantsData;
-
-        // Track sessions
-        const { joined, left } = await tracker.processRoom(roomData);
-        
-        return { joined, left, error: null };
-      } catch (error) {
-        console.error(` ❌ Error processing room ${roomData.room_id}:`, error.message);
-        return { joined: 0, left: 0, error: error.message };
-      }
-    })
-  );
-
-  // Sum up all joins and leaves
-  results.forEach(result => {
-    joinCount += result.joined;
-    leaveCount += result.left;
-  });
-
-  return { joinCount, leaveCount };
-}
-
-
-
-/**
- * Process room data (called for each batch while scrolling)
- */
-async function processRoomsData(rooms) {
-  let joinCount = 0;
-  let leaveCount = 0;
-  
-  for (const roomData of rooms) {
-    try {
-      // Normalize skill level
-      const skillLevelMap = {
-        'beginner': 'Beginner',
-        'intermediate': 'Intermediate',
-        'upper intermediate': 'Advanced',
-        'advanced': 'Advanced',
-        'upper advanced': 'Upper Advanced',
-        'any level': 'Any Level',
-        'all levels': 'Any Level',
-      };
-      const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
-
-      // Upsert room
-      await db.upsertRoom({
-        room_id: roomData.room_id,
-        language: roomData.language,
-        skill_level,
-        topic: roomData.topic,
-        max_capacity: -1,
-        is_active: true,
-        is_full: false,
-        is_empty: roomData.participants.length === 0,
-        allows_unlimited: true,
-        mic_allowed: true,
-        mic_required: false,
-      });
-
-      // Process participants
-      const participantsData = roomData.participants.map(p => ({
-        user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
-        username: p.username,
-        user_avatar: null,
-        followers_count: p.followers,
-        verification_status: 'UNVERIFIED',
-        position: p.position,
-      }));
-
-      roomData.participants = participantsData;
-
-      // Track sessions
-      const { joined, left } = await tracker.processRoom(roomData);
-      joinCount += joined;
-      leaveCount += left;
-
-    } catch (error) {
-      console.error(`   ❌ Error processing room ${roomData.room_id}:`, error.message);
-    }
-  }
-  
-  return { joinCount, leaveCount };
-}
- 
-
-
-
-/**
- * Process scraped data
- */
-async function processData(html) {
-  console.log('📊 Parsing rooms...');
-  const rooms = parseRooms(html);
-  if (rooms.length > 0) {
-    const sampleRoom = rooms[0];
-    console.log('\n📋 Sample Room:');
-    console.log(`   ID: ${sampleRoom.room_id}`);
-    console.log(`   Language: ${sampleRoom.language}`);
-    console.log(`   Participants: ${sampleRoom.participants.length}`);
-    if (sampleRoom.participants.length > 0) {
-      console.log(`   First User: ${sampleRoom.participants[0].username} (${sampleRoom.participants[0].followers_count} followers)`);
-    }
-  }
-
-  
-  const stats = parseLanguageStats(html);
-
-  console.log(`Found ${rooms.length} rooms`);
-
-  let totalJoins = 0;
-  let totalLeaves = 0;
-
-  // Process each room
-  for (const roomData of rooms) {
-    try {
-      // Upsert room
-      await db.upsertRoom(roomData);
-
-      // Track sessions
-      const { joined, left } = await tracker.processRoom(roomData);
-      totalJoins += joined;
-      totalLeaves += left;
-
-    } catch (error) {
-      console.error(`Error processing room ${roomData.room_id}:`, error);
-    }
-  }
-
-  // Get overall stats
-  const dbStats = await db.getStats();
-
-  console.log('\n📈 Statistics:');
-  console.log(`  Total Users: ${dbStats.total_users}`);
-  console.log(`  Total Rooms: ${dbStats.total_rooms}`);
-  console.log(`  Active Sessions: ${dbStats.active_sessions}`);
-  console.log(`  Total Sessions: ${dbStats.total_sessions}`);
-  console.log(`  This Cycle: +${totalJoins} joins, -${totalLeaves} leaves\n`);
-
-  return { rooms: rooms.length, joins: totalJoins, leaves: totalLeaves };
-}
-
-
 
 /**
  * Main scraping loop
@@ -447,60 +291,101 @@ async function scrapeLoop() {
   // Initialize tracker
   await tracker.initialize();
 
-  // Run once if --once flag is provided
+  // Check for one-time run flag
   const runOnce = process.argv.includes('--once');
-
   let cycleCount = 0;
 
   async function cycle() {
-  cycleCount++;
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`🔄 Cycle #${cycleCount} - ${new Date().toLocaleString()}`);
-  console.log('='.repeat(60));
+    cycleCount++;
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`🔄 Cycle #${cycleCount} - ${new Date().toLocaleString()}`);
+    console.log('='.repeat(60));
 
-  try {
-    const { roomCount, totalJoins, totalLeaves } = await fetchAndProcessRooms();
-    
-    const stats = await db.getStats();
-    
-    console.log('📈 Cycle Summary:');
-    console.log(`  Rooms Processed: ${roomCount}`);
-    console.log(`  User Activity: +${totalJoins} joins, -${totalLeaves} leaves`);
-    console.log(`\n💾 Database Stats:`);
-    console.log(`  Total Users: ${stats.total_users}`);
-    console.log(`  Total Rooms: ${stats.total_rooms}`);
-    console.log(`  Active Sessions: ${stats.active_sessions}`);
-    console.log(`  Total Sessions: ${stats.total_sessions}`);
-    
-    console.log('\n✅ Cycle completed successfully');
-  } catch (error) {
-    console.error('❌ Error in scrape cycle:', error.message);
-  }
+    try {
+      const { roomCount, totalJoins, totalLeaves } = await fetchAndProcessRooms();
+      const stats = await db.getStats();
 
-  if (!runOnce) {
-    console.log(`\n⏳ Next cycle in ${config.scraper.interval / 1000} seconds...\n`);
-    setTimeout(cycle, config.scraper.interval);
-  } else {
-    console.log('\n✅ Single run completed. Exiting...');
-    process.exit(0);
+      console.log('📈 Cycle Summary:');
+      console.log(`  Rooms Processed: ${roomCount}`);
+      console.log(`  User Activity: +${totalJoins} joins, -${totalLeaves} leaves`);
+      console.log(`\n💾 Database Stats:`);
+      console.log(`  Total Users: ${stats.total_users}`);
+      console.log(`  Total Rooms: ${stats.total_rooms}`);
+      console.log(`  Active Sessions: ${stats.active_sessions}`);
+      console.log(`  Total Sessions: ${stats.total_sessions}`);
+      console.log('\n✅ Cycle completed successfully');
+
+    } catch (error) {
+      console.error('❌ Error in scrape cycle:', error.message);
+      console.error('Stack:', error.stack);
+    }
+
+    // Schedule next cycle or exit
+    if (!runOnce) {
+      console.log(`\n⏳ Next cycle in ${config.scraper.interval / 1000} seconds...\n`);
+      setTimeout(cycle, config.scraper.interval);
+    } else {
+      console.log('\n✅ Single run completed. Exiting...');
+      await cleanup();
+      process.exit(0);
+    }
   }
-}
 
   // Start first cycle
   await cycle();
 }
 
 /**
- * Graceful shutdown
+ * Cleanup function
+ */
+async function cleanup() {
+  console.log('\n🛑 Shutting down gracefully...');
+  
+  if (globalBrowser) {
+    try {
+      await globalBrowser.close();
+      console.log('✅ Browser closed');
+    } catch (error) {
+      console.error('Error closing browser:', error.message);
+    }
+  }
+  
+  try {
+    await db.pool.end();
+    console.log('✅ Database connections closed');
+  } catch (error) {
+    console.error('Error closing database:', error.message);
+  }
+}
+
+/**
+ * Graceful shutdown handlers
  */
 process.on('SIGINT', async () => {
-  console.log('\n\n🛑 Shutting down gracefully...');
-  await db.pool.end();
+  await cleanup();
   process.exit(0);
 });
 
+process.on('SIGTERM', async () => {
+  await cleanup();
+  process.exit(0);
+});
+
+process.on('uncaughtException', async (error) => {
+  console.error('💥 Uncaught Exception:', error);
+  await cleanup();
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (reason, promise) => {
+  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+  await cleanup();
+  process.exit(1);
+});
+
 // Start the scraper
-scrapeLoop().catch(error => {
+scrapeLoop().catch(async (error) => {
   console.error('Fatal error:', error);
+  await cleanup();
   process.exit(1);
 });
