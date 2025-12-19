@@ -167,22 +167,33 @@ async function createSession(sessionData) {
   }
 }
 
-async function endSession(sessionId, leftAt, eventType = 'leave') {
-  const query = `
-    UPDATE sessions
-    SET left_at = $1, event_type = $2
-    WHERE session_id = $3 AND left_at IS NULL
-    RETURNING session_id;
-  `;
+    async function endSession(sessionId) {
+        // Use CURRENT_TIMESTAMP for consistent server time
+        const query = `
+            UPDATE sessions 
+            SET left_at = GREATEST(joined_at, CURRENT_TIMESTAMP),
+                duration = EXTRACT(EPOCH FROM (GREATEST(joined_at, CURRENT_TIMESTAMP) - joined_at))
+            WHERE id = $1
+            RETURNING id, duration;
+        `;
+        
+        try {
+            const res = await this.pool.query(query, [sessionId]);
+            return res.rows[0];
+        } catch (err) {
+            // If constraint fails, force close it by setting left_at = joined_at
+            if (err.code === '23514') { // check_violation
+                console.warn(`⚠️ Fixing timestamp mismatch for session ${sessionId}`);
+                await this.pool.query(
+                    `UPDATE sessions SET left_at = joined_at, duration = 0 WHERE id = $1`, 
+                    [sessionId]
+                );
+                return { id: sessionId, duration: 0 };
+            }
+            throw err;
+        }
+    }
 
-  try {
-    const result = await pool.query(query, [leftAt || new Date(), eventType, sessionId]);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error ending session:', error);
-    throw error;
-  }
-}
 
 async function endAllSessionsInRoom(roomId, userId, leftAt) {
   const query = `
