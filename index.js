@@ -1,506 +1,146 @@
-const { chromium } = require('playwright');
+const express = require('express');
+const cron = require('node-cron');
+const { Pool } = require('pg');
+const Free4TalkAPI = require('./apiDirectScraper');
 const config = require('./config');
-const { parseRooms, parseLanguageStats } = require('./parser');
-const SessionTracker = require('./tracker');
-const db = require('./db');
 
-const http = require('http');
-
-// Health check endpoint to keep Render awake
-const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('OK');
-  }
-});
-
+const app = express();
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Health check server running on port ${PORT}`);
+
+// Database connection (Aiven)
+const pool = new Pool({
+  connectionString: config.database.connectionString,
+  ssl: { rejectUnauthorized: false }
 });
 
-
-// Global tracker instance
-const tracker = new SessionTracker();
-
-/**
- * Helper: Wait for specified milliseconds
- */
-function wait(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Fetch and process rooms while scrolling (ULTRA-OPTIMIZED)
- */
-async function fetchAndProcessRooms() {
-  const { chromium } = require('playwright');
-  const cheerio = require('cheerio');
-  let browser;
-
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
-    });
-
-    const context = await browser.newContext({
-      viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    });
-
-    const page = await context.newPage();
-    console.log(`🌐 Navigating to ${config.scraper.url}...`);
-
-    await page.goto(config.scraper.url, {
-      waitUntil: 'networkidle',
-      timeout: 60000
-    });
-
-    console.log('⏳ Waiting for content to load...');
-    await page.waitForSelector('.group-list', { timeout: 15000 });
-    await wait(500);
-
-    console.log('📜 Scrolling and collecting rooms...\n');
-
-    const processedRoomIds = new Set();
-    let scrollsWithoutNewRooms = 0;
-    const maxScrollsWithoutNew = 3;
-    const allRoomsData = []; // Collect all rooms first
-
-    // PHASE 1: Fast scrolling and HTML collection (no DB calls)
-    for (let i = 0; i < 50; i++) {
-      const roomsHtml = await page.evaluate(() => {
-        const rooms = [];
-        document.querySelectorAll('.group-item:not(.fake)').forEach(roomEl => {
-          const idElement = roomEl.querySelector('[id^="group-"]');
-          const roomId = idElement ? idElement.id.replace('group-', '') : null;
-          if (roomId && !roomId.includes('fake')) {
-            rooms.push({
-              id: roomId,
-              html: roomEl.outerHTML
-            });
-          }
-        });
-        return rooms;
-      });
-
-      let newRoomsCount = 0;
-
-      for (const { id, html } of roomsHtml) {
-        if (!processedRoomIds.has(id)) {
-          processedRoomIds.add(id);
-          const $ = cheerio.load(html);
-          const $room = $('.group-item').first();
-
-          const language = $room.find('.sc-kvZOFW').text().trim() || 'Unknown';
-          const rawSkillLevel = $room.find('.sc-hqyNC').text().trim() || 'Any Level';
-          const topic = $room.find('.sc-jbKcbu .notranslate').text().trim() || 'Anything';
-
-          const participants = [];
-          $room.find('.client-item').each((idx, clientEl) => {
-            const $client = $(clientEl);
-            const isEmptySlot = $client.find('.blind').text().includes('Empty Slot') ||
-              $client.find('button[disabled]').length > 0;
-
-            if (isEmptySlot) return;
-
-            const username = $client.find('button[aria-label]').attr('aria-label');
-            if (!username || username === 'Empty Slot') return;
-
-            const followerText = $client.find('.followers-btn').text().trim();
-            const followerMatch = followerText.match(/(\d+)/);
-            const followers = followerMatch ? parseInt(followerMatch[1]) : 0;
-
-            participants.push({
-              username,
-              followers,
-              position: idx + 1
-            });
-          });
-
-          // Store for later batch processing
-          allRoomsData.push({
-            room_id: id,
-            language,
-            skill_level: rawSkillLevel,
-            topic,
-            participants
-          });
-
-          newRoomsCount++;
-        }
-      }
-
-      const statusIcon = newRoomsCount > 0 ? '✅' : '⏸️';
-      console.log(`  ${statusIcon} Scroll ${i + 1}: ${processedRoomIds.size} total rooms (+${newRoomsCount} new)`);
-
-      if (newRoomsCount === 0) {
-        scrollsWithoutNewRooms++;
-        if (scrollsWithoutNewRooms >= maxScrollsWithoutNew) {
-          console.log(`\n✅ Collected all ${processedRoomIds.size} rooms\n`);
-          break;
-        }
-      } else {
-        scrollsWithoutNewRooms = 0;
-      }
-
-      await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5));
-      await wait(300); // Even faster scroll
-    }
-
-    await browser.close();
-
-    // PHASE 2: Batch process all collected data
-    console.log('💾 Processing data...');
-    const { totalJoins, totalLeaves } = await processBatchRooms(allRoomsData);
-
-    return {
-      roomCount: processedRoomIds.size,
-      totalJoins,
-      totalLeaves
-    };
-
-  } catch (error) {
-    if (browser) await browser.close();
-    throw error;
-  }
-}
-
-/**
- * Process all rooms in ONE batch (much faster)
- */
-async function processBatchRooms(allRoomsData) {
-  console.log(`  Processing ${allRoomsData.length} rooms in batch...`);
-  
-  let totalJoins = 0;
-  let totalLeaves = 0;
-
-  // Process in parallel batches of 20 rooms
-  const batchSize = 20;
-  for (let i = 0; i < allRoomsData.length; i += batchSize) {
-    const batch = allRoomsData.slice(i, i + batchSize);
-    
-    const results = await Promise.all(
-      batch.map(async (roomData) => {
-        try {
-          const skillLevelMap = {
-            'beginner': 'Beginner',
-            'intermediate': 'Intermediate',
-            'upper intermediate': 'Advanced',
-            'advanced': 'Advanced',
-            'upper advanced': 'Upper Advanced',
-            'any level': 'Any Level',
-            'all levels': 'Any Level',
-          };
-          const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
-
-          await db.upsertRoom({
-            room_id: roomData.room_id,
-            language: roomData.language,
-            skill_level,
-            topic: roomData.topic,
-            max_capacity: -1,
-            is_active: true,
-            is_full: false,
-            is_empty: roomData.participants.length === 0,
-            allows_unlimited: true,
-            mic_allowed: true,
-            mic_required: false,
-          });
-
-          const participantsData = roomData.participants.map(p => ({
-            user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
-            username: p.username,
-            user_avatar: null,
-            followers_count: p.followers,
-            verification_status: 'UNVERIFIED',
-            position: p.position,
-          }));
-          roomData.participants = participantsData;
-
-          const { joined, left } = await tracker.processRoom(roomData);
-          return { joined, left };
-        } catch (error) {
-          console.error(`  ❌ Error: ${roomData.room_id}: ${error.message}`);
-          return { joined: 0, left: 0 };
-        }
-      })
-    );
-
-    results.forEach(r => {
-      totalJoins += r.joined;
-      totalLeaves += r.left;
-    });
-
-    console.log(`  ✅ Batch ${Math.floor(i / batchSize) + 1}: +${results.reduce((s, r) => s + r.joined, 0)} joins, -${results.reduce((s, r) => s + r.left, 0)} leaves`);
-  }
-
-  return { totalJoins, totalLeaves };
-}
-
-
-
-/**
- * Process room data (OPTIMIZED - parallel processing)
- */
-async function processRoomsData(rooms) {
-  let joinCount = 0;
-  let leaveCount = 0;
-
-  // Process ALL rooms in parallel instead of one-by-one
-  const results = await Promise.all(
-    rooms.map(async (roomData) => {
-      try {
-        // Normalize skill level
-        const skillLevelMap = {
-          'beginner': 'Beginner',
-          'intermediate': 'Intermediate',
-          'upper intermediate': 'Advanced',
-          'advanced': 'Advanced',
-          'upper advanced': 'Upper Advanced',
-          'any level': 'Any Level',
-          'all levels': 'Any Level',
-        };
-        const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
-
-        // Upsert room and process participants in parallel
-        await db.upsertRoom({
-          room_id: roomData.room_id,
-          language: roomData.language,
-          skill_level,
-          topic: roomData.topic,
-          max_capacity: -1,
-          is_active: true,
-          is_full: false,
-          is_empty: roomData.participants.length === 0,
-          allows_unlimited: true,
-          mic_allowed: true,
-          mic_required: false,
-        });
-
-        // Process participants
-        const participantsData = roomData.participants.map(p => ({
-          user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
-          username: p.username,
-          user_avatar: null,
-          followers_count: p.followers,
-          verification_status: 'UNVERIFIED',
-          position: p.position,
-        }));
-        roomData.participants = participantsData;
-
-        // Track sessions
-        const { joined, left } = await tracker.processRoom(roomData);
-        
-        return { joined, left, error: null };
-      } catch (error) {
-        console.error(` ❌ Error processing room ${roomData.room_id}:`, error.message);
-        return { joined: 0, left: 0, error: error.message };
-      }
-    })
-  );
-
-  // Sum up all joins and leaves
-  results.forEach(result => {
-    joinCount += result.joined;
-    leaveCount += result.left;
-  });
-
-  return { joinCount, leaveCount };
-}
-
-
-
-/**
- * Process room data (called for each batch while scrolling)
- */
-async function processRoomsData(rooms) {
-  let joinCount = 0;
-  let leaveCount = 0;
-  
-  for (const roomData of rooms) {
-    try {
-      // Normalize skill level
-      const skillLevelMap = {
-        'beginner': 'Beginner',
-        'intermediate': 'Intermediate',
-        'upper intermediate': 'Advanced',
-        'advanced': 'Advanced',
-        'upper advanced': 'Upper Advanced',
-        'any level': 'Any Level',
-        'all levels': 'Any Level',
-      };
-      const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
-
-      // Upsert room
-      await db.upsertRoom({
-        room_id: roomData.room_id,
-        language: roomData.language,
-        skill_level,
-        topic: roomData.topic,
-        max_capacity: -1,
-        is_active: true,
-        is_full: false,
-        is_empty: roomData.participants.length === 0,
-        allows_unlimited: true,
-        mic_allowed: true,
-        mic_required: false,
-      });
-
-      // Process participants
-      const participantsData = roomData.participants.map(p => ({
-        user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
-        username: p.username,
-        user_avatar: null,
-        followers_count: p.followers,
-        verification_status: 'UNVERIFIED',
-        position: p.position,
-      }));
-
-      roomData.participants = participantsData;
-
-      // Track sessions
-      const { joined, left } = await tracker.processRoom(roomData);
-      joinCount += joined;
-      leaveCount += left;
-
-    } catch (error) {
-      console.error(`   ❌ Error processing room ${roomData.room_id}:`, error.message);
-    }
-  }
-  
-  return { joinCount, leaveCount };
-}
- 
-
-
-
-/**
- * Process scraped data
- */
-async function processData(html) {
-  console.log('📊 Parsing rooms...');
-  const rooms = parseRooms(html);
-  if (rooms.length > 0) {
-    const sampleRoom = rooms[0];
-    console.log('\n📋 Sample Room:');
-    console.log(`   ID: ${sampleRoom.room_id}`);
-    console.log(`   Language: ${sampleRoom.language}`);
-    console.log(`   Participants: ${sampleRoom.participants.length}`);
-    if (sampleRoom.participants.length > 0) {
-      console.log(`   First User: ${sampleRoom.participants[0].username} (${sampleRoom.participants[0].followers_count} followers)`);
-    }
-  }
-
-  
-  const stats = parseLanguageStats(html);
-
-  console.log(`Found ${rooms.length} rooms`);
-
-  let totalJoins = 0;
-  let totalLeaves = 0;
-
-  // Process each room
-  for (const roomData of rooms) {
-    try {
-      // Upsert room
-      await db.upsertRoom(roomData);
-
-      // Track sessions
-      const { joined, left } = await tracker.processRoom(roomData);
-      totalJoins += joined;
-      totalLeaves += left;
-
-    } catch (error) {
-      console.error(`Error processing room ${roomData.room_id}:`, error);
-    }
-  }
-
-  // Get overall stats
-  const dbStats = await db.getStats();
-
-  console.log('\n📈 Statistics:');
-  console.log(`  Total Users: ${dbStats.total_users}`);
-  console.log(`  Total Rooms: ${dbStats.total_rooms}`);
-  console.log(`  Active Sessions: ${dbStats.active_sessions}`);
-  console.log(`  Total Sessions: ${dbStats.total_sessions}`);
-  console.log(`  This Cycle: +${totalJoins} joins, -${totalLeaves} leaves\n`);
-
-  return { rooms: rooms.length, joins: totalJoins, leaves: totalLeaves };
-}
-
-
-
-/**
- * Main scraping loop
- */
-async function scrapeLoop() {
-  console.log('🚀 Starting Free4Talk Tracker Scraper...\n');
-
-  // Initialize tracker
-  await tracker.initialize();
-
-  // Run once if --once flag is provided
-  const runOnce = process.argv.includes('--once');
-
-  let cycleCount = 0;
-
-  async function cycle() {
-  cycleCount++;
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`🔄 Cycle #${cycleCount} - ${new Date().toLocaleString()}`);
-  console.log('='.repeat(60));
-
-  try {
-    const { roomCount, totalJoins, totalLeaves } = await fetchAndProcessRooms();
-    
-    const stats = await db.getStats();
-    
-    console.log('📈 Cycle Summary:');
-    console.log(`  Rooms Processed: ${roomCount}`);
-    console.log(`  User Activity: +${totalJoins} joins, -${totalLeaves} leaves`);
-    console.log(`\n💾 Database Stats:`);
-    console.log(`  Total Users: ${stats.total_users}`);
-    console.log(`  Total Rooms: ${stats.total_rooms}`);
-    console.log(`  Active Sessions: ${stats.active_sessions}`);
-    console.log(`  Total Sessions: ${stats.total_sessions}`);
-    
-    console.log('\n✅ Cycle completed successfully');
-  } catch (error) {
-    console.error('❌ Error in scrape cycle:', error.message);
-  }
-
-  if (!runOnce) {
-    console.log(`\n⏳ Next cycle in ${config.scraper.interval / 1000} seconds...\n`);
-    setTimeout(cycle, config.scraper.interval);
+// Test database connection
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('❌ Database connection failed:', err);
   } else {
-    console.log('\n✅ Single run completed. Exiting...');
-    process.exit(0);
+    console.log('✅ Database connected:', res.rows[0].now);
+  }
+});
+
+// API Scraper instance
+const scraper = new Free4TalkAPI();
+
+// Save to database function
+async function saveToDatabase(groups) {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    let savedCount = 0;
+    
+    for (const group of groups) {
+      // Save group
+      await client.query(`
+        INSERT INTO groups (group_id, topic, language, level, client_count, scraped_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        ON CONFLICT (group_id) 
+        DO UPDATE SET 
+          topic = $2,
+          language = $3,
+          level = $4,
+          client_count = $5,
+          scraped_at = NOW()
+      `, [
+        group.groupId,
+        group.topic,
+        group.language,
+        group.level,
+        group.clients.length
+      ]);
+
+      // Save users
+      for (const client of group.clients) {
+        await pool.query(`
+          INSERT INTO users (user_id, username, followers, scraped_at)
+          VALUES ($1, $2, $3, NOW())
+          ON CONFLICT (user_id)
+          DO UPDATE SET
+            username = $2,
+            followers = $3,
+            scraped_at = NOW()
+        `, [client.id, client.username, client.followers]);
+      }
+
+      savedCount++;
+    }
+    
+    await client.query('COMMIT');
+    console.log(`✅ Saved ${savedCount} groups to database`);
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('❌ Database error:', error);
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
-  // Start first cycle
-  await cycle();
+// Main scraping function
+async function runScraper() {
+  console.log('\n🚀 Starting scrape at:', new Date().toISOString());
+  
+  try {
+    // Fetch from API
+    const rawData = await scraper.fetchGroups();
+    
+    // Parse data
+    const { groups, userIds } = scraper.parseGroups(rawData);
+    
+    console.log(`📊 Found ${groups.length} groups, ${userIds.length} users`);
+    
+    // Save to database
+    await saveToDatabase(groups);
+    
+    console.log('✅ Scrape completed successfully!\n');
+    
+  } catch (error) {
+    console.error('❌ Scrape failed:', error.message);
+  }
 }
 
-/**
- * Graceful shutdown
- */
-process.on('SIGINT', async () => {
-  console.log('\n\n🛑 Shutting down gracefully...');
-  await db.pool.end();
-  process.exit(0);
+// Schedule scraping every 5 minutes
+cron.schedule('*/5 * * * *', () => {
+  console.log('⏰ Cron job triggered');
+  runScraper();
 });
 
-// Start the scraper
-scrapeLoop().catch(error => {
-  console.error('Fatal error:', error);
-  process.exit(1);
+// Run once on startup
+runScraper();
+
+// API Routes
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'running',
+    message: 'Free4Talk Scraper Active',
+    time: new Date().toISOString()
+  });
+});
+
+app.get('/api/groups', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM groups ORDER BY scraped_at DESC LIMIT 50');
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/users', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM users ORDER BY scraped_at DESC LIMIT 50');
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
