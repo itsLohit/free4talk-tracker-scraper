@@ -73,7 +73,7 @@ async function fetchAndProcessRooms() {
     
     const processedRoomIds = new Set();
     let scrollsWithoutNewRooms = 0;
-    const maxScrollsWithoutNew = 5;
+    const maxScrollsWithoutNew = 3;
     let totalJoins = 0;
     let totalLeaves = 0;
     

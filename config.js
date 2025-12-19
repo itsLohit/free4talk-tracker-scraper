@@ -38,6 +38,6 @@ module.exports = {
   db: parseDatabaseUrl(process.env.DATABASE_URL),
   scraper: {
     url: 'https://free4talk.com/',
-    interval: 60000, // 60 seconds (optimized for Railway)
+    interval: 5000, // 60 seconds (optimized for Railway)
   },
 };
