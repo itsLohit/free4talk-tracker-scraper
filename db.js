@@ -1,251 +1,112 @@
 const { Pool } = require('pg');
-const config = require('./config');
+const { DB_CONNECTION_STRING } = require('./config');
 
-// Create connection pool
-const pool = new Pool(config.db);
-
-// Test connection
-pool.on('connect', () => {
-  console.log('✅ Connected to PostgreSQL database');
+const pool = new Pool({
+  connectionString: DB_CONNECTION_STRING,
+  ssl: { rejectUnauthorized: false },
+  max: 20, // Max clients in pool
+  idleTimeoutMillis: 30000
 });
 
 pool.on('error', (err) => {
-  console.error('❌ Database error:', err);
+  console.error('❌ Unexpected DB Client Error', err);
+  // Don't exit process, just log it. Pool will reconnect.
 });
 
-// ============================================
-// USER QUERIES
-// ============================================
+// 1. Save/Update User
+async function upsertUser(user) {
+  if (!user.user_id) return; // Skip invalid users
 
-async function upsertUser(userData) {
   const query = `
     INSERT INTO users (
-      user_id, username, user_avatar, verification_status,
-      followers_count, first_seen, last_seen
-    ) VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+      user_id, username, user_avatar, is_verified, 
+      followers_count, following_count, friends_count, 
+      last_seen_at, is_online
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     ON CONFLICT (user_id) DO UPDATE SET
       username = EXCLUDED.username,
       user_avatar = EXCLUDED.user_avatar,
-      verification_status = EXCLUDED.verification_status,
-      followers_count = EXCLUDED.followers_count,
-      last_seen = NOW(),
-      updated_at = NOW()
-    RETURNING user_id;
+      followers_count = GREATEST(users.followers_count, EXCLUDED.followers_count),
+      last_seen_at = EXCLUDED.last_seen_at,
+      is_online = EXCLUDED.is_online;
   `;
-
-  const values = [
-    userData.user_id,
-    userData.username,
-    userData.user_avatar,
-    userData.verification_status || 'UNVERIFIED',
-    userData.followers_count || 0,
-  ];
-
   try {
-    const result = await pool.query(query, values);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error upserting user:', error);
-    throw error;
-  }
+      await pool.query(query, [
+        user.user_id, user.username, user.user_avatar, user.is_verified,
+        user.followers_count, user.following_count, user.friends_count,
+        user.last_seen_at, user.is_online
+      ]);
+  } catch(e) { console.error("Upsert User Failed:", e.message); }
 }
 
-// ============================================
-// ROOM QUERIES
-// ============================================
+// 2. Save/Update Room
+async function upsertRoom(room) {
+  if (!room.room_id) return;
 
-async function upsertRoom(roomData) {
   const query = `
     INSERT INTO rooms (
-      room_id, language, skill_level, topic, max_capacity,
-      is_active, is_full, is_empty, allows_unlimited,
-      mic_allowed, mic_required, first_seen, last_activity
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+      room_id, creator_id, topic, language, skill_level, 
+      max_capacity, room_url, mic_allowed, is_locked, 
+      created_at, is_active
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
     ON CONFLICT (room_id) DO UPDATE SET
-      language = EXCLUDED.language,
-      skill_level = EXCLUDED.skill_level,
       topic = EXCLUDED.topic,
-      max_capacity = EXCLUDED.max_capacity,
       is_active = EXCLUDED.is_active,
-      is_full = EXCLUDED.is_full,
-      is_empty = EXCLUDED.is_empty,
-      allows_unlimited = EXCLUDED.allows_unlimited,
-      mic_allowed = EXCLUDED.mic_allowed,
-      mic_required = EXCLUDED.mic_required,
-      last_activity = NOW(),
-      updated_at = NOW()
-    RETURNING room_id;
+      peak_concurrent_users = GREATEST(rooms.peak_concurrent_users, EXCLUDED.peak_concurrent_users);
   `;
-
-  const values = [
-    roomData.room_id,
-    roomData.language || 'Unknown',
-    roomData.skill_level || 'Any Level',
-    roomData.topic || 'Anything',
-    roomData.max_capacity || -1,
-    roomData.is_active !== false,
-    roomData.is_full || false,
-    roomData.is_empty || false,
-    roomData.allows_unlimited || false,
-    roomData.mic_allowed !== false,
-    roomData.mic_required || false,
-  ];
-
   try {
-    const result = await pool.query(query, values);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error upserting room:', error);
-    throw error;
-  }
+      await pool.query(query, [
+        room.room_id, room.creator_id, room.topic, room.language, room.skill_level,
+        room.max_capacity, room.room_url, room.mic_allowed, room.is_locked,
+        room.created_at, room.is_active
+      ]);
+  } catch(e) { console.error("Upsert Room Failed:", e.message); }
 }
 
-// ============================================
-// SESSION QUERIES
-// ============================================
+// 3. Sync Sessions
+async function syncRoomSessions(roomId, usersInRoom) {
+    const client = await pool.connect(); // Use a single client for transaction safety
+    try {
+        await client.query('BEGIN');
 
-async function getActiveSessions(roomId) {
-  const query = `
-    SELECT session_id, user_id, room_id, joined_at
-    FROM sessions
-    WHERE room_id = $1 AND is_currently_active = true;
-  `;
-
-  try {
-    const result = await pool.query(query, [roomId]);
-    return result.rows;
-  } catch (error) {
-    console.error('Error getting active sessions:', error);
-    throw error;
-  }
-}
-
-/**
- * Get current participants in a room
- */
-async function getRoomParticipants(room_id) {
-  try {
-    const result = await pool.query(
-      `SELECT u.user_id, u.username, s.session_id
-       FROM sessions s
-       JOIN users u ON s.user_id = u.user_id
-       WHERE s.room_id = $1 AND s.is_currently_active = true`,
-      [room_id]
-    );
-    return result.rows;
-  } catch (error) {
-    console.error('Error getting room participants:', error);
-    throw error;
-  }
-}
-
-
-async function createSession(sessionData) {
-  const query = `
-    INSERT INTO sessions (
-      user_id, room_id, joined_at, user_position,
-      mic_was_on, event_type
-    ) VALUES ($1, $2, $3, $4, $5, $6)
-    RETURNING session_id;
-  `;
-
-  const values = [
-    sessionData.user_id,
-    sessionData.room_id,
-    sessionData.joined_at || new Date(),
-    sessionData.user_position || null,
-    sessionData.mic_was_on || false,
-    sessionData.event_type || 'join',
-  ];
-
-  try {
-    const result = await pool.query(query, values);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error creating session:', error);
-    throw error;
-  }
-}
-
-    async function endSession(sessionId) {
-        // Use CURRENT_TIMESTAMP for consistent server time
-        const query = `
-            UPDATE sessions 
-            SET left_at = GREATEST(joined_at, CURRENT_TIMESTAMP),
-                duration = EXTRACT(EPOCH FROM (GREATEST(joined_at, CURRENT_TIMESTAMP) - joined_at))
-            WHERE id = $1
-            RETURNING id, duration;
-        `;
-        
-        try {
-            const res = await this.pool.query(query, [sessionId]);
-            return res.rows[0];
-        } catch (err) {
-            // If constraint fails, force close it by setting left_at = joined_at
-            if (err.code === '23514') { // check_violation
-                console.warn(`⚠️ Fixing timestamp mismatch for session ${sessionId}`);
-                await this.pool.query(
-                    `UPDATE sessions SET left_at = joined_at, duration = 0 WHERE id = $1`, 
-                    [sessionId]
-                );
-                return { id: sessionId, duration: 0 };
-            }
-            throw err;
+        // A. Handle Users Leaving
+        if (usersInRoom.length > 0) {
+            const currentIds = usersInRoom.map(u => `'${u.user_id}'`).join(',');
+            await client.query(`
+                UPDATE sessions SET left_at = NOW(), is_active = false 
+                WHERE room_id = $1 AND is_active = true AND user_id NOT IN (${currentIds})
+            `, [roomId]);
+        } else {
+            await client.query(`
+                UPDATE sessions SET left_at = NOW(), is_active = false 
+                WHERE room_id = $1 AND is_active = true
+            `, [roomId]);
         }
+
+        // B. Handle Users Joining
+        for (const user of usersInRoom) {
+            // We must upsert user here inside the transaction to ensure FK validity
+            await upsertUser(user); 
+            
+            await client.query(`
+                INSERT INTO sessions (user_id, room_id, joined_at, is_active)
+                SELECT $1, $2, NOW(), true
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM sessions 
+                    WHERE user_id = $1 AND room_id = $2 AND is_active = true
+                );
+            `, [user.user_id, roomId]);
+        }
+
+        await client.query('COMMIT');
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error(`Sync Session Error for Room ${roomId}:`, e.message);
+    } finally {
+        client.release();
     }
-
-
-async function endAllSessionsInRoom(roomId, userId, leftAt) {
-  const query = `
-    UPDATE sessions
-    SET left_at = $1, event_type = 'leave'
-    WHERE room_id = $2 AND user_id = $3 AND left_at IS NULL
-    RETURNING session_id;
-  `;
-
-  try {
-    const result = await pool.query(query, [leftAt || new Date(), roomId, userId]);
-    return result.rows;
-  } catch (error) {
-    console.error('Error ending sessions:', error);
-    throw error;
-  }
 }
 
-// ============================================
-// STATISTICS
-// ============================================
-
-async function getStats() {
-  const query = `
-    SELECT 
-      (SELECT COUNT(*) FROM users) as total_users,
-      (SELECT COUNT(*) FROM rooms) as total_rooms,
-      (SELECT COUNT(*) FROM sessions WHERE is_currently_active = true) as active_sessions,
-      (SELECT COUNT(*) FROM sessions) as total_sessions
-  `;
-
-  try {
-    const result = await pool.query(query);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error getting stats:', error);
-    throw error;
-  }
-}
-
-// ============================================
-// EXPORTS
-// ============================================
-
-module.exports = {
-  pool,
-  upsertUser,
-  upsertRoom,
-  getActiveSessions,
-  createSession,
-  endSession,
-  endAllSessionsInRoom,
-  getRoomParticipants,
-  getStats,
-};
+module.exports = { pool, upsertUser, upsertRoom, syncRoomSessions };
