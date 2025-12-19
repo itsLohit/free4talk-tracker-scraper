@@ -67,7 +67,7 @@ async function fetchAndProcessRooms() {
 
     console.log('⏳ Waiting for content to load...');
     await page.waitForSelector('.group-list', { timeout: 15000 });
-    await wait(3000);
+    await wait(500);
 
     console.log('📜 Scrolling and processing rooms...\n');
     
@@ -172,7 +172,7 @@ async function fetchAndProcessRooms() {
 
       // Scroll
       await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5));
-      await wait(2000);
+      await wait(500);
     }
 
     await browser.close();
