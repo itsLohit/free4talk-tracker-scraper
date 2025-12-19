@@ -8,10 +8,15 @@
     "dev": "nodemon index.js",
     "test": "node index.js --once"
   },
-  "keywords": ["free4talk", "tracker", "scraper"],
+  "keywords": [
+    "free4talk",
+    "tracker",
+    "scraper"
+  ],
   "author": "Lohit T",
   "license": "MIT",
   "dependencies": {
+    "axios": "^1.13.2",
     "cheerio": "^1.0.0-rc.12",
     "dotenv": "^16.3.1",
     "pg": "^8.11.3",
