@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+
 const config = require('./config');
 
 // Create connection pool
@@ -16,6 +17,26 @@ pool.on('error', (err) => {
 // ============================================
 // USER QUERIES (ENHANCED WITH HISTORY TRACKING)
 // ============================================
+
+/**
+ * Sanitize supporter level to ensure it's a valid integer
+ */
+function sanitizeSupporterLevel(value) {
+    if (value === null || value === undefined) return 0;
+
+    // If it's a timestamp (too large), extract a reasonable level
+    const num = parseInt(value);
+    if (isNaN(num)) return 0;
+
+    // PostgreSQL INTEGER max is 2147483647
+    // If value is too large (likely a timestamp), return 0
+    if (num > 2147483647 || num < -2147483648) {
+        return 0;
+    }
+
+    // Ensure it's between 0 and 10 (typical supporter levels)
+    return Math.max(0, Math.min(10, num));
+}
 
 /**
  * Upsert user with full social metrics and history tracking
@@ -51,10 +72,10 @@ async function upsertUser(userData) {
         userData.username,
         userData.user_avatar || null,
         userData.verification_status || 'UNVERIFIED',
-        userData.followers_count || 0,
-        userData.following_count || 0,
-        userData.friends_count || 0,
-        userData.supporter_level || 0,
+        parseInt(userData.followers_count) || 0,
+        parseInt(userData.following_count) || 0,
+        parseInt(userData.friends_count) || 0,
+        sanitizeSupporterLevel(userData.supporter_level),  // FIX: Sanitize supporter_level
     ];
 
     try {
@@ -310,7 +331,7 @@ async function createSession(sessionData) {
 async function endAllSessionsInRoom(roomId, userId, leftAt) {
     const query = `
         UPDATE sessions
-        SET left_at = $1, 
+        SET left_at = $1,
             duration_seconds = EXTRACT(EPOCH FROM ($1 - joined_at))::INTEGER,
             event_type = 'leave',
             is_currently_active = false
@@ -329,8 +350,8 @@ async function endAllSessionsInRoom(roomId, userId, leftAt) {
                 [
                     userId,
                     'room_leave',
-                    JSON.stringify({ 
-                        room_id: roomId, 
+                    JSON.stringify({
+                        room_id: roomId,
                         left_at: leftAt,
                         sessions_ended: result.rows.length
                     })
@@ -390,35 +411,43 @@ async function recordProfileView(userId, viewerIp, viewerUserAgent) {
 }
 
 /**
- * Update daily room analytics
+ * Update daily room analytics (FIXED)
  */
 async function updateRoomAnalytics(roomId) {
+    // FIX: Split into two separate queries to avoid type confusion
     const query = `
         INSERT INTO room_analytics (
-            room_id, date, total_participants, unique_participants,
-            total_sessions, avg_session_duration_seconds, peak_concurrent_users
+            room_id, 
+            date, 
+            total_participants, 
+            unique_participants,
+            total_sessions, 
+            avg_session_duration_seconds, 
+            peak_concurrent_users
         )
-        SELECT 
-            $1,
+        SELECT
+            $1::VARCHAR,
             CURRENT_DATE,
             COUNT(*) as total_participants,
             COUNT(DISTINCT user_id) as unique_participants,
             COUNT(*) as total_sessions,
-            AVG(COALESCE(duration_seconds, 0))::REAL as avg_duration,
-            (
-                SELECT MAX(concurrent)
+            COALESCE(AVG(COALESCE(duration_seconds, 0)), 0)::REAL as avg_duration,
+            COALESCE((
+                SELECT MAX(concurrent_count)
                 FROM (
-                    SELECT COUNT(*) as concurrent
+                    SELECT 
+                        DATE_TRUNC('minute', joined_at) as time_slot,
+                        COUNT(*) as concurrent_count
                     FROM sessions
-                    WHERE room_id = $1
-                    AND DATE(joined_at) = CURRENT_DATE
-                    AND is_currently_active = true
-                    GROUP BY DATE_TRUNC('hour', joined_at)
+                    WHERE room_id = $1::VARCHAR
+                        AND DATE(joined_at) = CURRENT_DATE
+                        AND (is_currently_active = true OR left_at IS NOT NULL)
+                    GROUP BY DATE_TRUNC('minute', joined_at)
                 ) subq
-            ) as peak_concurrent
+            ), 0) as peak_concurrent
         FROM sessions
-        WHERE room_id = $1
-        AND DATE(joined_at) = CURRENT_DATE
+        WHERE room_id = $1::VARCHAR
+            AND DATE(joined_at) = CURRENT_DATE
         ON CONFLICT (room_id, date) DO UPDATE SET
             total_participants = EXCLUDED.total_participants,
             unique_participants = EXCLUDED.unique_participants,
@@ -431,6 +460,7 @@ async function updateRoomAnalytics(roomId) {
         await pool.query(query, [roomId]);
     } catch (error) {
         console.error('Error updating room analytics:', error);
+        // Don't throw - this is non-critical
     }
 }
 
@@ -444,7 +474,7 @@ async function markInactiveRooms(activeRoomIds) {
         UPDATE rooms
         SET is_active = false, updated_at = NOW()
         WHERE is_active = true
-        AND room_id NOT IN (${activeRoomIds.map((_, i) => `$${i + 1}`).join(',')})
+            AND room_id NOT IN (${activeRoomIds.map((_, i) => `$${i + 1}`).join(',')})
         RETURNING room_id;
     `;
 
@@ -467,18 +497,15 @@ module.exports = {
     upsertUser,
     logUserProfileChanges,
     recordProfileView,
-
     // Room functions
     upsertRoom,
     createRoomSnapshot,
     markInactiveRooms,
-
     // Session functions
     getActiveSessions,
     createSession,
     endAllSessionsInRoom,
     getRoomParticipants,
-
     // Analytics
     getStats,
     updateRoomAnalytics,
