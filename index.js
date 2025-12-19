@@ -191,66 +191,74 @@ async function fetchAndProcessRooms() {
 
 
 /**
- * Process room data (called for each batch while scrolling)
- * Returns join/leave counts without individual logs
+ * Process room data (OPTIMIZED - parallel processing)
  */
 async function processRoomsData(rooms) {
   let joinCount = 0;
   let leaveCount = 0;
-  
-  for (const roomData of rooms) {
-    try {
-      // Normalize skill level
-      const skillLevelMap = {
-        'beginner': 'Beginner',
-        'intermediate': 'Intermediate',
-        'upper intermediate': 'Advanced',
-        'advanced': 'Advanced',
-        'upper advanced': 'Upper Advanced',
-        'any level': 'Any Level',
-        'all levels': 'Any Level',
-      };
-      const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
 
-      // Upsert room
-      await db.upsertRoom({
-        room_id: roomData.room_id,
-        language: roomData.language,
-        skill_level,
-        topic: roomData.topic,
-        max_capacity: -1,
-        is_active: true,
-        is_full: false,
-        is_empty: roomData.participants.length === 0,
-        allows_unlimited: true,
-        mic_allowed: true,
-        mic_required: false,
-      });
+  // Process ALL rooms in parallel instead of one-by-one
+  const results = await Promise.all(
+    rooms.map(async (roomData) => {
+      try {
+        // Normalize skill level
+        const skillLevelMap = {
+          'beginner': 'Beginner',
+          'intermediate': 'Intermediate',
+          'upper intermediate': 'Advanced',
+          'advanced': 'Advanced',
+          'upper advanced': 'Upper Advanced',
+          'any level': 'Any Level',
+          'all levels': 'Any Level',
+        };
+        const skill_level = skillLevelMap[roomData.skill_level.toLowerCase().trim()] || 'Any Level';
 
-      // Process participants
-      const participantsData = roomData.participants.map(p => ({
-        user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
-        username: p.username,
-        user_avatar: null,
-        followers_count: p.followers,
-        verification_status: 'UNVERIFIED',
-        position: p.position,
-      }));
+        // Upsert room and process participants in parallel
+        await db.upsertRoom({
+          room_id: roomData.room_id,
+          language: roomData.language,
+          skill_level,
+          topic: roomData.topic,
+          max_capacity: -1,
+          is_active: true,
+          is_full: false,
+          is_empty: roomData.participants.length === 0,
+          allows_unlimited: true,
+          mic_allowed: true,
+          mic_required: false,
+        });
 
-      roomData.participants = participantsData;
+        // Process participants
+        const participantsData = roomData.participants.map(p => ({
+          user_id: p.username.toLowerCase().replace(/[^a-z0-9]/g, '-'),
+          username: p.username,
+          user_avatar: null,
+          followers_count: p.followers,
+          verification_status: 'UNVERIFIED',
+          position: p.position,
+        }));
+        roomData.participants = participantsData;
 
-      // Track sessions (WITHOUT LOGGING EACH ONE)
-      const { joined, left } = await tracker.processRoom(roomData);
-      joinCount += joined;
-      leaveCount += left;
+        // Track sessions
+        const { joined, left } = await tracker.processRoom(roomData);
+        
+        return { joined, left, error: null };
+      } catch (error) {
+        console.error(` ❌ Error processing room ${roomData.room_id}:`, error.message);
+        return { joined: 0, left: 0, error: error.message };
+      }
+    })
+  );
 
-    } catch (error) {
-      console.error(`   ❌ Error processing room ${roomData.room_id}:`, error.message);
-    }
-  }
-  
+  // Sum up all joins and leaves
+  results.forEach(result => {
+    joinCount += result.joined;
+    leaveCount += result.left;
+  });
+
   return { joinCount, leaveCount };
 }
+
 
 
 /**
