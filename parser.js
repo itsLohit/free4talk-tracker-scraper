@@ -1,68 +1,69 @@
 /**
- * Standardizes skill levels so your DB analytics work correctly.
+ * Maps Free4Talk's raw skill levels to your clean DB constraints.
  */
 function normalizeSkillLevel(level) {
     if (!level) return 'Any Level';
+    
+    // Map from your old code
+    const skillMap = {
+        'beginner': 'Beginner',
+        'upper beginner': 'Beginner',
+        'intermediate': 'Intermediate',
+        'upper intermediate': 'Intermediate',
+        'advanced': 'Advanced',
+        'upper advanced': 'Advanced',
+        'any level': 'Any Level'
+    };
+
     const lower = level.toLowerCase().trim();
-    if (lower.includes('beginner')) return 'Beginner';
-    if (lower.includes('upper intermediate')) return 'Advanced'; // Map to closest
-    if (lower.includes('intermediate')) return 'Intermediate';
-    if (lower.includes('advanced')) return 'Advanced';
-    return 'Any Level';
+    return skillMap[lower] || 'Any Level';
 }
 
-function parseSnapshot(data) {
+/**
+ * Parses the raw API object (which is a Map of ID -> Group)
+ */
+function parseSnapshot(apiData) {
   const rooms = [];
   
-  // Safety check
-  if (!data || !data.data) {
-      return { rooms, activeRoomIds: new Set() };
+  // apiData is an OBJECT, not an array. We must iterate its keys.
+  // Example: { "123": { topic: "Hi", ... }, "456": { ... } }
+  for (const [id, group] of Object.entries(apiData)) {
+    
+    // 1. Map Room
+    const room = {
+      room_id: String(group.id),
+      creator_id: String(group.userId), // Note: Verify if API sends 'userId' or just 'creator'
+      topic: (group.topic || "").substring(0, 499),
+      language: group.language || "Unknown",
+      skill_level: normalizeSkillLevel(group.level),
+      max_capacity: group.maxPeople || 0,
+      room_url: group.url || "",
+      
+      // Settings usually come in group.settings
+      mic_allowed: group.settings ? !group.settings.noMic : true,
+      is_locked: group.settings ? !!group.settings.isLocked : false,
+      
+      created_at: group.createdAt ? new Date(group.createdAt) : new Date(),
+      is_active: true,
+      
+      // 2. Map Users (Clients)
+      users: (group.clients || []).map(client => ({
+          user_id: String(client.id),
+          username: client.name || "Unknown",
+          user_avatar: client.avatar || "",
+          is_verified: !!client.isVerified,
+          followers_count: Number(client.followers) || 0,
+          following_count: Number(client.following) || 0,
+          friends_count: Number(client.friends) || 0,
+          is_online: true,
+          last_seen_at: new Date()
+      }))
+    };
+
+    rooms.push(room);
   }
 
-  try {
-      for (const roomId in data.data) {
-        const r = data.data[roomId];
-        
-        // 1. Map Room Data
-        const room = {
-          room_id: String(r.id),
-          creator_id: String(r.userId),
-          topic: (r.topic || "No Topic").substring(0, 499), // Truncate to fit DB
-          language: r.language || "Unknown",
-          skill_level: normalizeSkillLevel(r.level),
-          max_capacity: r.maxPeople || 0,
-          room_url: r.url || "",
-          
-          // Fix: Handle different settings formats
-          mic_allowed: r.settings ? !r.settings.noMic : true,
-          is_locked: r.settings ? !!r.settings.isLocked : false,
-          
-          created_at: r.createdAt ? new Date(r.createdAt) : new Date(),
-          is_active: true,
-          
-          // 2. Map Users
-          users: (r.clients || []).map(client => ({
-              user_id: String(client.id),
-              username: client.name || "Unknown",
-              user_avatar: client.avatar || "",
-              is_verified: !!client.isVerified,
-              followers_count: Number(client.followers) || 0,
-              following_count: Number(client.following) || 0,
-              friends_count: Number(client.friends) || 0,
-              is_online: true,
-              last_seen_at: new Date()
-          }))
-        };
-        rooms.push(room);
-      }
-  } catch (error) {
-      console.error("Error inside parser:", error);
-  }
-
-  return { 
-      rooms, 
-      activeRoomIds: new Set(rooms.map(r => r.room_id)) 
-  };
+  return { rooms };
 }
 
 module.exports = { parseSnapshot };
