@@ -42,105 +42,158 @@ function sanitizeSupporterLevel(value) {
  * Upsert user with full social metrics and history tracking
  */
 async function upsertUser(userData) {
-    // First, get the old user data to detect changes
-    const oldUser = await pool.query(
-        'SELECT * FROM users WHERE user_id = $1',
-        [userData.user_id]
-    );
-
-    const query = `
-        INSERT INTO users (
-            user_id, username, user_avatar, verification_status,
-            followers_count, following_count, friends_count, supporter_level,
-            first_seen, last_seen
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-        ON CONFLICT (user_id) DO UPDATE SET
-            username = EXCLUDED.username,
-            user_avatar = EXCLUDED.user_avatar,
-            verification_status = EXCLUDED.verification_status,
-            followers_count = EXCLUDED.followers_count,
-            following_count = EXCLUDED.following_count,
-            friends_count = EXCLUDED.friends_count,
-            supporter_level = EXCLUDED.supporter_level,
-            last_seen = NOW(),
-            updated_at = NOW()
-        RETURNING *;
-    `;
-
-    const values = [
-        userData.user_id,
-        userData.username,
-        userData.user_avatar || null,
-        userData.verification_status || 'UNVERIFIED',
-        parseInt(userData.followers_count) || 0,
-        parseInt(userData.following_count) || 0,
-        parseInt(userData.friends_count) || 0,
-        sanitizeSupporterLevel(userData.supporter_level),  // FIX: Sanitize supporter_level
-    ];
-
-    try {
-        const result = await pool.query(query, values);
-        const newUser = result.rows[0];
-
-        // Log profile changes if user existed before
-        if (oldUser.rows.length > 0) {
-            await logUserProfileChanges(oldUser.rows[0], newUser);
-        }
-
-        return newUser;
-    } catch (error) {
-        console.error('Error upserting user:', error);
-        throw error;
+  // First, get the old user data to detect changes
+  const oldUser = await pool.query(`SELECT * FROM users WHERE userid = $1`, [userData.userid]);
+  
+  // Smart value selection: Don't overwrite good data with zeros
+  const getSmartValue = (newVal, oldVal, defaultVal = 0) => {
+    const parsedNew = parseInt(newVal) || 0;
+    const parsedOld = parseInt(oldVal) || 0;
+    
+    // If new value is 0 but old value was positive, keep old value
+    if (parsedNew === 0 && parsedOld > 0) {
+      return parsedOld;
     }
+    
+    // Otherwise use new value
+    return parsedNew || defaultVal;
+  };
+  
+  // Prepare values with smart fallback
+  const followersCount = oldUser.rows.length > 0 
+    ? getSmartValue(userData.followerscount, oldUser.rows[0].followerscount) 
+    : (parseInt(userData.followerscount) || 0);
+    
+  const followingCount = oldUser.rows.length > 0 
+    ? getSmartValue(userData.followingcount, oldUser.rows[0].followingcount) 
+    : (parseInt(userData.followingcount) || 0);
+    
+  const friendsCount = oldUser.rows.length > 0 
+    ? getSmartValue(userData.friendscount, oldUser.rows[0].friendscount) 
+    : (parseInt(userData.friendscount) || 0);
+  
+  const query = `
+    INSERT INTO users (
+      userid, username, useravatar, verificationstatus,
+      followerscount, followingcount, friendscount, supporterlevel,
+      firstseen, lastseen
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+    ON CONFLICT (userid) DO UPDATE SET
+      username = EXCLUDED.username,
+      useravatar = EXCLUDED.useravatar,
+      verificationstatus = EXCLUDED.verificationstatus,
+      followerscount = EXCLUDED.followerscount,
+      followingcount = EXCLUDED.followingcount,
+      friendscount = EXCLUDED.friendscount,
+      supporterlevel = EXCLUDED.supporterlevel,
+      lastseen = NOW(),
+      updatedat = NOW()
+    RETURNING *`;
+  
+  const values = [
+    userData.userid,
+    userData.username,
+    userData.useravatar || null,
+    userData.verificationstatus || 'UNVERIFIED',
+    followersCount,
+    followingCount,
+    friendsCount,
+    sanitizeSupporterLevel(userData.supporterlevel),
+  ];
+  
+  try {
+    const result = await pool.query(query, values);
+    const newUser = result.rows[0];
+    
+    // Log profile changes if user existed before
+    if (oldUser.rows.length > 0) {
+      await logUserProfileChanges(oldUser.rows[0], newUser);
+    }
+    
+    return newUser;
+  } catch (error) {
+    console.error('Error upserting user:', error);
+    throw error;
+  }
 }
+
 
 /**
  * Log user profile changes for history tracking
  */
+// Log user profile changes for history tracking 
 async function logUserProfileChanges(oldUser, newUser) {
-    const changes = {};
-
-    // Track changes in key fields
-    if (oldUser.followers_count !== newUser.followers_count) {
-        changes.followers_count = {
-            old: oldUser.followers_count,
-            new: newUser.followers_count,
-            diff: newUser.followers_count - oldUser.followers_count
-        };
-    }
-
-    if (oldUser.following_count !== newUser.following_count) {
-        changes.following_count = {
-            old: oldUser.following_count,
-            new: newUser.following_count,
-            diff: newUser.following_count - oldUser.following_count
-        };
-    }
-
-    if (oldUser.friends_count !== newUser.friends_count) {
-        changes.friends_count = {
-            old: oldUser.friends_count,
-            new: newUser.friends_count,
-            diff: newUser.friends_count - oldUser.friends_count
-        };
-    }
-
-    if (oldUser.username !== newUser.username) {
-        changes.username = {
-            old: oldUser.username,
-            new: newUser.username
-        };
-    }
-
-    // If there are changes, log them
-    if (Object.keys(changes).length > 0) {
-        await pool.query(
-            `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
-             VALUES ($1, $2, $3)`,
-            [newUser.user_id, 'profile_update', JSON.stringify(changes)]
-        );
-    }
+  const changes = {};
+  
+  // Helper function to detect if a change is valid
+  const isValidChange = (oldVal, newVal) => {
+    // Ignore changes TO zero (likely bad data from scraper)
+    if (newVal === 0 && oldVal > 0) return false;
+    
+    // Ignore changes FROM zero to same value (duplicate logging)
+    if (oldVal === 0 && newVal === 0) return false;
+    
+    // Only log if there's a real difference
+    return oldVal !== newVal;
+  };
+  
+  // Track changes in key fields with smart detection
+  if (isValidChange(oldUser.followerscount, newUser.followerscount)) {
+    changes.followers_count = {
+      old: oldUser.followerscount,
+      new: newUser.followerscount,
+      diff: newUser.followerscount - oldUser.followerscount
+    };
+  }
+  
+  if (isValidChange(oldUser.followingcount, newUser.followingcount)) {
+    changes.following_count = {
+      old: oldUser.followingcount,
+      new: newUser.followingcount,
+      diff: newUser.followingcount - oldUser.followingcount
+    };
+  }
+  
+  if (isValidChange(oldUser.friendscount, newUser.friendscount)) {
+    changes.friends_count = {
+      old: oldUser.friendscount,
+      new: newUser.friendscount,
+      diff: newUser.friendscount - oldUser.friendscount
+    };
+  }
+  
+  if (oldUser.supporterlevel !== newUser.supporterlevel && newUser.supporterlevel > 0) {
+    changes.supporter_level = {
+      old: oldUser.supporterlevel,
+      new: newUser.supporterlevel,
+      diff: newUser.supporterlevel - oldUser.supporterlevel
+    };
+  }
+  
+  if (oldUser.username !== newUser.username) {
+    changes.username = {
+      old: oldUser.username,
+      new: newUser.username
+    };
+  }
+  
+  if (oldUser.verificationstatus !== newUser.verificationstatus) {
+    changes.verification_status = {
+      old: oldUser.verificationstatus,
+      new: newUser.verificationstatus
+    };
+  }
+  
+  // If there are VALID changes, log them
+  if (Object.keys(changes).length > 0) {
+    await pool.query(
+      `INSERT INTO user_activity_log (userid, activitytype, activitydata)
+       VALUES ($1, $2, $3)`,
+      [newUser.userid, 'profile_update', JSON.stringify(changes)]
+    );
+  }
 }
+
 
 // ============================================
 // ROOM QUERIES (ENHANCED WITH FULL API DATA)
