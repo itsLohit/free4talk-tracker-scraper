@@ -1,574 +1,275 @@
-const { Pool } = require('pg');
+const { chromium } = require('playwright');
+const db = require('./db');
+const SessionTracker = require('./tracker');
 const config = require('./config');
 
-// Create connection pool
-const pool = new Pool(config.db);
+const tracker = new SessionTracker();
 
-// Test connection
-pool.on('connect', () => {
-  console.log('✅ Connected to PostgreSQL database');
-});
+async function startSmartScraper() {
+  console.log('🚀 Starting Smart Network Interceptor...');
+  console.log('📊 Features enabled:');
+  console.log('  ✓ Auto user profile tracking');
+  console.log('  ✓ Profile change history');
+  console.log('  ✓ Room snapshots every 5 minutes');
+  console.log('  ✓ Activity logging');
+  console.log('  ✓ Daily analytics');
+  console.log('  ✓ QUEUE-BASED DATA COLLECTION (No Data Loss!)');
+  console.log('');
 
-pool.on('error', (err) => {
-  console.error('❌ Database error:', err);
-});
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
 
-// ============================================
-// USER QUERIES (ENHANCED WITH HISTORY TRACKING)
-// ============================================
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
-/**
- * Sanitize supporter level to ensure it's a valid integer
- */
-function sanitizeSupporterLevel(value) {
-  if (value === null || value === undefined) return 0;
-  
-  // If it's a timestamp (too large), extract a reasonable level
-  const num = parseInt(value);
-  if (isNaN(num)) return 0;
-  
-  // PostgreSQL INTEGER max is 2147483647
-  // If value is too large (likely a timestamp), return 0
-  if (num > 2147483647 || num < -2147483648) {
-    return 0;
+  await tracker.initialize();
+
+  // ✅ FIXED: Use a queue instead of single variable
+  const dataQueue = [];
+  let isProcessing = false;
+  let cycleCount = 0;
+  let interceptCount = 0;
+
+  // Intercept network responses
+  page.on('response', async response => {
+    const url = response.url();
+    
+    // ✅ FIXED: Capture multiple API patterns
+    if (url.includes('/sync/get/free4talk/groups/') || 
+        url.includes('/api/groups') ||
+        url.includes('/groups')) {
+      try {
+        const json = await response.json();
+        
+        if (json.success && json.data) {
+          interceptCount++;
+          const groupCount = Object.keys(json.data).length;
+          
+          // ✅ FIXED: Push to queue instead of overwriting
+          dataQueue.push({
+            timestamp: new Date(),
+            data: json.data,
+            count: groupCount
+          });
+          
+          console.log(`⚡ INTERCEPTED #${interceptCount}: ${groupCount} groups (Queue: ${dataQueue.length})`);
+        }
+      } catch (err) {
+        // Ignore parse errors
+      }
+    }
+  });
+
+  console.log('🌐 Navigating to Free4Talk...');
+  await page.goto('https://www.free4talk.com/', { 
+    waitUntil: 'domcontentloaded', // ✅ FIXED: Faster than networkidle
+    timeout: 30000 
+  });
+
+  // ✅ FIXED: Continuous processing loop (no waiting)
+  async function processQueue() {
+    while (true) {
+      if (dataQueue.length > 0 && !isProcessing) {
+        isProcessing = true;
+        cycleCount++;
+        
+        // Get all pending data
+        const batchSize = dataQueue.length;
+        const batch = dataQueue.splice(0, batchSize);
+        
+        console.log(`\n🔄 Cycle #${cycleCount}: Processing ${batchSize} batches`);
+        
+        // Merge all data (latest wins for duplicates)
+        const mergedData = {};
+        for (const item of batch) {
+          Object.assign(mergedData, item.data);
+        }
+        
+        console.log(`💾 Combined ${batchSize} batches into ${Object.keys(mergedData).length} unique rooms`);
+        
+        try {
+          await processApiData(mergedData);
+        } catch (error) {
+          console.error('❌ Error processing batch:', error.message);
+        }
+        
+        isProcessing = false;
+        
+        // Show tracker stats
+        const stats = tracker.getStats();
+        console.log(`📈 Tracker: ${stats.activeUsers} users, ${stats.activeSessions} sessions`);
+        
+        // Get database stats every 10 cycles
+        if (cycleCount % 10 === 0) {
+          try {
+            const dbStats = await db.getStats();
+            console.log('\n📊 Database Statistics:');
+            console.log(`   Users: ${dbStats.total_users}`);
+            console.log(`   Rooms: ${dbStats.total_rooms} (${dbStats.active_rooms} active)`);
+            console.log(`   Sessions: ${dbStats.total_sessions} (${dbStats.active_sessions} active)`);
+            console.log(`   Profile views (24h): ${dbStats.views_24h}`);
+            console.log(`   Snapshots: ${dbStats.total_snapshots}`);
+          } catch (error) {
+            console.error('Error fetching stats:', error.message);
+          }
+        }
+      }
+      
+      // ✅ FIXED: Short sleep to reduce CPU usage
+      await new Promise(r => setTimeout(r, 100));
+    }
   }
-  
-  // Ensure it's between 0 and 10 (typical supporter levels)
-  return Math.max(0, Math.min(10, num));
+
+  // ✅ FIXED: Trigger page refresh to get fresh data periodically
+  async function pageRefresher() {
+    while (true) {
+      await new Promise(r => setTimeout(r, 30000)); // Every 30 seconds
+      
+      try {
+        console.log('🔄 Refreshing page to capture new data...');
+        await page.reload({ waitUntil: 'domcontentloaded' });
+      } catch (error) {
+        console.error('Error refreshing page:', error.message);
+      }
+    }
+  }
+
+  // Start both loops
+  processQueue();
+  pageRefresher();
 }
 
 /**
- * Upsert user with full social metrics and history tracking
+ * ✅ FIXED: Process API data with parallel processing
  */
-async function upsertUser(userData) {
-  // Validate that user_id exists
-  if (!userData.user_id) {
-    console.warn(`⚠️  Skipping user insert: user_id is null or undefined for username "${userData.username || 'unknown'}"`);
-    return null;
-  }
-  
-  // First, get the old user data to detect changes
-  const oldUser = await pool.query(`SELECT * FROM users WHERE user_id = $1`, [userData.user_id]);
-  
-  // Smart value selection: Don't overwrite good data with zeros
-  const getSmartValue = (newVal, oldVal, defaultVal = 0) => {
-    const parsedNew = parseInt(newVal) || 0;
-    const parsedOld = parseInt(oldVal) || 0;
-    
-    // If new value is 0 but old value was positive, keep old value
-    if (parsedNew === 0 && parsedOld > 0) {
-      return parsedOld;
-    }
-    
-    // Otherwise use new value
-    return parsedNew || defaultVal;
+async function processApiData(apiGroups) {
+  const processedRooms = [];
+  const activeRoomIds = [];
+  const errors = [];
+
+  // Skill level mapping
+  const skillMap = {
+    'Beginner': 'Beginner',
+    'Upper Beginner': 'Beginner',
+    'Intermediate': 'Intermediate',
+    'Upper Intermediate': 'Intermediate',
+    'Advanced': 'Advanced',
+    'Upper Advanced': 'Advanced',
+    'Any Level': 'Any Level'
   };
+
+  // ✅ FIXED: Process rooms in parallel batches
+  const entries = Object.entries(apiGroups);
+  const BATCH_SIZE = 10; // Process 10 rooms at a time
   
-  // Prepare values with smart fallback
-  const followersCount = oldUser.rows.length > 0
-    ? getSmartValue(userData.followers_count, oldUser.rows[0].followers_count)
-    : (parseInt(userData.followers_count) || 0);
+  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+    const batch = entries.slice(i, i + BATCH_SIZE);
     
-  const followingCount = oldUser.rows.length > 0
-    ? getSmartValue(userData.following_count, oldUser.rows[0].following_count)
-    : (parseInt(userData.following_count) || 0);
-    
-  const friendsCount = oldUser.rows.length > 0
-    ? getSmartValue(userData.friends_count, oldUser.rows[0].friends_count)
-    : (parseInt(userData.friends_count) || 0);
-  
-  const query = `
-    INSERT INTO users (
-      user_id, username, user_avatar, verification_status,
-      followers_count, following_count, friends_count, supporter_level,
-      first_seen, last_seen
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-    ON CONFLICT (user_id) DO UPDATE SET
-      username = EXCLUDED.username,
-      user_avatar = EXCLUDED.user_avatar,
-      verification_status = EXCLUDED.verification_status,
-      followers_count = EXCLUDED.followers_count,
-      following_count = EXCLUDED.following_count,
-      friends_count = EXCLUDED.friends_count,
-      supporter_level = EXCLUDED.supporter_level,
-      last_seen = NOW(),
-      updated_at = NOW()
-    RETURNING *`;
-  
-  const values = [
-    userData.user_id,
-    userData.username || 'Unknown User',
-    userData.user_avatar || null,
-    userData.verification_status || 'UNVERIFIED',
-    followersCount,
-    followingCount,
-    friendsCount,
-    sanitizeSupporterLevel(userData.supporter_level),
-  ];
-  
-  try {
-    const result = await pool.query(query, values);
-    const newUser = result.rows[0];
-    
-    // Log profile changes if user existed before
-    if (oldUser.rows.length > 0) {
-      await logUserProfileChanges(oldUser.rows[0], newUser);
+    await Promise.all(batch.map(async ([id, group]) => {
+      try {
+        // Extract creator information first
+        let creatorData = null;
+        if (group.creator) {
+          creatorData = {
+            creator_user_id: group.creator.id || group.userId,
+            creator_name: group.creator.name,
+            creator_avatar: group.creator.avatar,
+            creator_is_verified: group.creator.isVerified || false
+          };
+
+          // Upsert creator as a user
+          await db.upsertUser({
+            user_id: creatorData.creator_user_id,
+            username: creatorData.creator_name,
+            user_avatar: creatorData.creator_avatar,
+            verification_status: creatorData.creator_is_verified ? 'VERIFIED' : 'UNVERIFIED',
+            followers_count: group.creator.followers || 0,
+            following_count: group.creator.following || 0,
+            friends_count: group.creator.friends || 0,
+            supporter_level: group.creator.supporter || 0
+          });
+        }
+
+        // Map skill level
+        const cleanSkill = skillMap[group.level] || 'Any Level';
+
+        // Build complete room data
+        const roomData = {
+          room_id: group.id,
+          channel: group.channel || 'free4talk',
+          platform: group.platform || 'Free4Talk',
+          topic: group.topic || 'Anything',
+          language: group.language || 'Unknown',
+          second_language: group.secondLanguage || null,
+          skill_level: cleanSkill,
+          max_capacity: group.maxPeople || -1,
+          allows_unlimited: (group.maxPeople === -1) || false,
+          is_locked: group.settings?.isLocked || false,
+          mic_allowed: !group.settings?.noMic,
+          mic_required: false,
+          al_mic: group.settings?.alMic || 0,
+          no_mic: group.settings?.noMic || false,
+          url: group.url || null,
+          is_active: true,
+          is_full: false,
+          is_empty: !group.clients || group.clients.length === 0,
+          current_users_count: group.clients ? group.clients.length : 0,
+          ...creatorData
+        };
+
+        // Upsert room
+        await db.upsertRoom(roomData);
+        activeRoomIds.push(group.id);
+
+        // Extract participants with full data
+        const participants = (group.clients || []).map((client, index) => ({
+          user_id: client.id,
+          username: client.name,
+          user_avatar: client.avatar || null,
+          followers_count: client.followers || 0,
+          following_count: client.following || 0,
+          friends_count: client.friends || 0,
+          supporter_level: client.supporter || 0,
+          verification_status: client.isVerified ? 'VERIFIED' : 'UNVERIFIED',
+          position: index + 1
+        }));
+
+        // Process room with tracker
+        const { joined, left } = await tracker.processRoom({
+          room_id: group.id,
+          participants: participants
+        });
+
+        if (joined > 0 || left > 0) {
+          console.log(`   📍 ${group.topic} (${group.language}): +${joined} -${left}`);
+        }
+
+        processedRooms.push(group.id);
+      } catch (error) {
+        errors.push({ room_id: group.id, error: error.message });
+      }
+    }));
+  }
+
+  // Mark rooms that are no longer active
+  if (activeRoomIds.length > 0) {
+    const inactiveRooms = await db.markInactiveRooms(activeRoomIds);
+    if (inactiveRooms && inactiveRooms.length > 0) {
+      console.log(`🔴 Marked ${inactiveRooms.length} rooms as inactive`);
     }
-    
-    return newUser;
-  } catch (error) {
-    console.error('Error upserting user:', error);
-    console.error('User data:', { user_id: userData.user_id, username: userData.username });
-    throw error;
+  }
+
+  console.log(`✅ Processed ${processedRooms.length} rooms`);
+  if (errors.length > 0) {
+    console.log(`⚠️  ${errors.length} errors occurred`);
   }
 }
 
-/**
- * Log user profile changes for history tracking
- */
-async function logUserProfileChanges(oldUser, newUser) {
-  const changes = {};
-  
-  // Helper function to detect if a change is valid
-  const isValidChange = (oldVal, newVal) => {
-    // Ignore changes TO zero (likely bad data from scraper)
-    if (newVal === 0 && oldVal > 0) return false;
-    
-    // Ignore changes FROM zero to same value (duplicate logging)
-    if (oldVal === 0 && newVal === 0) return false;
-    
-    // Only log if there's a real difference
-    return oldVal !== newVal;
-  };
-  
-  // Track changes in key fields with smart detection
-  if (isValidChange(oldUser.followers_count, newUser.followers_count)) {
-    changes.followers_count = {
-      old: oldUser.followers_count,
-      new: newUser.followers_count,
-      diff: newUser.followers_count - oldUser.followers_count
-    };
-  }
-  
-  if (isValidChange(oldUser.following_count, newUser.following_count)) {
-    changes.following_count = {
-      old: oldUser.following_count,
-      new: newUser.following_count,
-      diff: newUser.following_count - oldUser.following_count
-    };
-  }
-  
-  if (isValidChange(oldUser.friends_count, newUser.friends_count)) {
-    changes.friends_count = {
-      old: oldUser.friends_count,
-      new: newUser.friends_count,
-      diff: newUser.friends_count - oldUser.friends_count
-    };
-  }
-  
-  if (oldUser.supporter_level !== newUser.supporter_level && newUser.supporter_level > 0) {
-    changes.supporter_level = {
-      old: oldUser.supporter_level,
-      new: newUser.supporter_level,
-      diff: newUser.supporter_level - oldUser.supporter_level
-    };
-  }
-  
-  if (oldUser.username !== newUser.username) {
-    changes.username = {
-      old: oldUser.username,
-      new: newUser.username
-    };
-  }
-  
-  if (oldUser.verification_status !== newUser.verification_status) {
-    changes.verification_status = {
-      old: oldUser.verification_status,
-      new: newUser.verification_status
-    };
-  }
-  
-  // If there are VALID changes, log them
-  if (Object.keys(changes).length > 0) {
-    await pool.query(
-      `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
-       VALUES ($1, $2, $3)`,
-      [newUser.user_id, 'profile_update', JSON.stringify(changes)]
-    );
-  }
-}
-
-// ============================================
-// ROOM QUERIES (ENHANCED WITH FULL API DATA)
-// ============================================
-
-/**
- * Upsert room with complete data from API
- */
-async function upsertRoom(roomData) {
-  const query = `
-    INSERT INTO rooms (
-      room_id, channel, platform, topic, language, second_language,
-      skill_level, max_capacity, allows_unlimited, is_locked,
-      mic_allowed, mic_required, al_mic, no_mic,
-      url, creator_user_id, creator_name, creator_avatar, creator_is_verified,
-      is_active, is_full, is_empty, current_users_count,
-      first_seen, last_activity
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, NOW(), NOW())
-    ON CONFLICT (room_id) DO UPDATE SET
-      channel = EXCLUDED.channel,
-      platform = EXCLUDED.platform,
-      topic = EXCLUDED.topic,
-      language = EXCLUDED.language,
-      second_language = EXCLUDED.second_language,
-      skill_level = EXCLUDED.skill_level,
-      max_capacity = EXCLUDED.max_capacity,
-      allows_unlimited = EXCLUDED.allows_unlimited,
-      is_locked = EXCLUDED.is_locked,
-      mic_allowed = EXCLUDED.mic_allowed,
-      mic_required = EXCLUDED.mic_required,
-      al_mic = EXCLUDED.al_mic,
-      no_mic = EXCLUDED.no_mic,
-      url = EXCLUDED.url,
-      creator_user_id = EXCLUDED.creator_user_id,
-      creator_name = EXCLUDED.creator_name,
-      creator_avatar = EXCLUDED.creator_avatar,
-      creator_is_verified = EXCLUDED.creator_is_verified,
-      is_active = EXCLUDED.is_active,
-      is_full = EXCLUDED.is_full,
-      is_empty = EXCLUDED.is_empty,
-      current_users_count = EXCLUDED.current_users_count,
-      last_activity = NOW(),
-      updated_at = NOW()
-    RETURNING room_id;
-  `;
-  
-  const values = [
-    roomData.room_id,
-    roomData.channel || 'free4talk',
-    roomData.platform || 'Free4Talk',
-    roomData.topic || 'Anything',
-    roomData.language || 'Unknown',
-    roomData.second_language || null,
-    roomData.skill_level || 'Any Level',
-    roomData.max_capacity || -1,
-    roomData.allows_unlimited || (roomData.max_capacity === -1),
-    roomData.is_locked || false,
-    roomData.mic_allowed !== false,
-    roomData.mic_required || false,
-    roomData.al_mic || 0,
-    roomData.no_mic || false,
-    roomData.url || null,
-    roomData.creator_user_id || null,
-    roomData.creator_name || null,
-    roomData.creator_avatar || null,
-    roomData.creator_is_verified || false,
-    roomData.is_active !== false,
-    roomData.is_full || false,
-    roomData.is_empty || false,
-    roomData.current_users_count || 0,
-  ];
-  
-  try {
-    const result = await pool.query(query, values);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error upserting room:', error);
-    throw error;
-  }
-}
-
-/**
- * Create room snapshot for historical tracking
- */
-async function createRoomSnapshot(roomId, participants) {
-  const query = `
-    INSERT INTO room_snapshots (
-      room_id, snapshot_time, participants_count, participants_json, is_active
-    ) VALUES ($1, NOW(), $2, $3, $4)
-    RETURNING snapshot_id;
-  `;
-  
-  const values = [
-    roomId,
-    participants.length,
-    JSON.stringify(participants),
-    true
-  ];
-  
-  try {
-    const result = await pool.query(query, values);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error creating room snapshot:', error);
-    throw error;
-  }
-}
-
-// ============================================
-// SESSION QUERIES
-// ============================================
-
-async function getActiveSessions(roomId) {
-  const query = `
-    SELECT session_id, user_id, room_id, joined_at
-    FROM sessions
-    WHERE room_id = $1 AND is_currently_active = true;
-  `;
-  
-  try {
-    const result = await pool.query(query, [roomId]);
-    return result.rows;
-  } catch (error) {
-    console.error('Error getting active sessions:', error);
-    throw error;
-  }
-}
-
-/**
- * Get current participants in a room
- */
-async function getRoomParticipants(room_id) {
-  try {
-    const result = await pool.query(
-      `SELECT u.user_id, u.username, s.session_id
-       FROM sessions s
-       JOIN users u ON s.user_id = u.user_id
-       WHERE s.room_id = $1 AND s.is_currently_active = true`,
-      [room_id]
-    );
-    return result.rows;
-  } catch (error) {
-    console.error('Error getting room participants:', error);
-    throw error;
-  }
-}
-
-async function createSession(sessionData) {
-  // Validate user_id exists
-  if (!sessionData.user_id) {
-    console.warn(`⚠️  Skipping session creation: user_id is null`);
-    return null;
-  }
-  
-  const query = `
-    INSERT INTO sessions (
-      user_id, room_id, joined_at, user_position,
-      mic_was_on, event_type, is_currently_active
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-    RETURNING session_id;
-  `;
-  
-  const values = [
-    sessionData.user_id,
-    sessionData.room_id,
-    sessionData.joined_at || new Date(),
-    sessionData.user_position || null,
-    sessionData.mic_was_on || false,
-    sessionData.event_type || 'join',
-    true
-  ];
-  
-  try {
-    const result = await pool.query(query, values);
-    
-    // Log activity
-    await pool.query(
-      `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
-       VALUES ($1, $2, $3)`,
-      [
-        sessionData.user_id,
-        'room_join',
-        JSON.stringify({ room_id: sessionData.room_id, joined_at: sessionData.joined_at })
-      ]
-    );
-    
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error creating session:', error);
-    throw error;
-  }
-}
-
-async function endAllSessionsInRoom(roomId, userId, leftAt) {
-  const query = `
-    UPDATE sessions
-    SET left_at = $1,
-        duration_seconds = EXTRACT(EPOCH FROM ($1 - joined_at))::INTEGER,
-        event_type = 'leave',
-        is_currently_active = false
-    WHERE room_id = $2 AND user_id = $3 AND left_at IS NULL
-    RETURNING session_id, duration_seconds;
-  `;
-  
-  try {
-    const result = await pool.query(query, [leftAt || new Date(), roomId, userId]);
-    
-    // Log activity if sessions were ended
-    if (result.rows.length > 0) {
-      await pool.query(
-        `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
-         VALUES ($1, $2, $3)`,
-        [
-          userId,
-          'room_leave',
-          JSON.stringify({
-            room_id: roomId,
-            left_at: leftAt,
-            sessions_ended: result.rows.length
-          })
-        ]
-      );
-    }
-    
-    return result.rows;
-  } catch (error) {
-    console.error('Error ending sessions:', error);
-    throw error;
-  }
-}
-
-// ============================================
-// STATISTICS & ANALYTICS
-// ============================================
-
-async function getStats() {
-  const query = `
-    SELECT
-      (SELECT COUNT(*) FROM users) as total_users,
-      (SELECT COUNT(*) FROM rooms) as total_rooms,
-      (SELECT COUNT(*) FROM rooms WHERE is_active = true) as active_rooms,
-      (SELECT COUNT(*) FROM sessions WHERE is_currently_active = true) as active_sessions,
-      (SELECT COUNT(*) FROM sessions) as total_sessions,
-      (SELECT COUNT(*) FROM profile_views WHERE viewed_at >= NOW() - INTERVAL '24 hours') as views_24h,
-      (SELECT COUNT(*) FROM room_snapshots) as total_snapshots
-  `;
-  
-  try {
-    const result = await pool.query(query);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error getting stats:', error);
-    throw error;
-  }
-}
-
-/**
- * Record profile view for leaderboard
- */
-async function recordProfileView(userId, viewerIp, viewerUserAgent) {
-  const query = `
-    INSERT INTO profile_views (viewed_user_id, viewer_ip, viewer_user_agent, viewed_at)
-    VALUES ($1, $2, $3, NOW())
-    RETURNING view_id;
-  `;
-  
-  try {
-    const result = await pool.query(query, [userId, viewerIp, viewerUserAgent]);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error recording profile view:', error);
-    throw error;
-  }
-}
-
-/**
- * Update daily room analytics
- */
-async function updateRoomAnalytics(roomId) {
-  const query = `
-    INSERT INTO room_analytics (
-      room_id,
-      date,
-      total_participants,
-      unique_participants,
-      total_sessions,
-      avg_session_duration_seconds,
-      peak_concurrent_users
-    )
-    SELECT
-      $1::VARCHAR,
-      CURRENT_DATE,
-      COUNT(*) as total_participants,
-      COUNT(DISTINCT user_id) as unique_participants,
-      COUNT(*) as total_sessions,
-      COALESCE(AVG(COALESCE(duration_seconds, 0)), 0)::REAL as avg_duration,
-      COALESCE((
-        SELECT MAX(concurrent_count)
-        FROM (
-          SELECT
-            DATE_TRUNC('minute', joined_at) as time_slot,
-            COUNT(*) as concurrent_count
-          FROM sessions
-          WHERE room_id = $1::VARCHAR
-            AND DATE(joined_at) = CURRENT_DATE
-            AND (is_currently_active = true OR left_at IS NOT NULL)
-          GROUP BY DATE_TRUNC('minute', joined_at)
-        ) subq
-      ), 0) as peak_concurrent
-    FROM sessions
-    WHERE room_id = $1::VARCHAR
-      AND DATE(joined_at) = CURRENT_DATE
-    ON CONFLICT (room_id, date) DO UPDATE SET
-      total_participants = EXCLUDED.total_participants,
-      unique_participants = EXCLUDED.unique_participants,
-      total_sessions = EXCLUDED.total_sessions,
-      avg_session_duration_seconds = EXCLUDED.avg_session_duration_seconds,
-      peak_concurrent_users = EXCLUDED.peak_concurrent_users;
-  `;
-  
-  try {
-    await pool.query(query, [roomId]);
-  } catch (error) {
-    console.error('Error updating room analytics:', error);
-    // Don't throw - this is non-critical
-  }
-}
-
-/**
- * Mark inactive rooms as no longer active
- */
-async function markInactiveRooms(activeRoomIds) {
-  if (activeRoomIds.length === 0) return;
-  
-  const query = `
-    UPDATE rooms
-    SET is_active = false, updated_at = NOW()
-    WHERE is_active = true
-      AND room_id NOT IN (${activeRoomIds.map((_, i) => `$${i + 1}`).join(',')})
-    RETURNING room_id;
-  `;
-  
-  try {
-    const result = await pool.query(query, activeRoomIds);
-    return result.rows;
-  } catch (error) {
-    console.error('Error marking inactive rooms:', error);
-    throw error;
-  }
-}
-
-// ============================================
-// EXPORTS
-// ============================================
-
-module.exports = {
-  pool,
-  // User functions
-  upsertUser,
-  logUserProfileChanges,
-  recordProfileView,
-  // Room functions
-  upsertRoom,
-  createRoomSnapshot,
-  markInactiveRooms,
-  // Session functions
-  getActiveSessions,
-  createSession,
-  endAllSessionsInRoom,
-  getRoomParticipants,
-  // Analytics
-  getStats,
-  updateRoomAnalytics,
-};
+// Start the scraper
+startSmartScraper().catch(error => {
+  console.error('💥 Fatal error:', error);
+  process.exit(1);
+});
 
