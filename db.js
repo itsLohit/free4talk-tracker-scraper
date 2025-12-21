@@ -23,10 +23,12 @@ pool.on('error', (err) => {
 function sanitizeSupporterLevel(value) {
   if (value === null || value === undefined) return 0;
   
+  // If it's a timestamp (too large), extract a reasonable level
   const num = parseInt(value);
   if (isNaN(num)) return 0;
   
   // PostgreSQL INTEGER max is 2147483647
+  // If value is too large (likely a timestamp), return 0
   if (num > 2147483647 || num < -2147483648) {
     return 0;
   }
@@ -39,8 +41,14 @@ function sanitizeSupporterLevel(value) {
  * Upsert user with full social metrics and history tracking
  */
 async function upsertUser(userData) {
+  // Validate that user_id exists
+  if (!userData.user_id) {
+    console.warn(`⚠️  Skipping user insert: user_id is null or undefined for username "${userData.username || 'unknown'}"`);
+    return null;
+  }
+  
   // First, get the old user data to detect changes
-  const oldUser = await pool.query(`SELECT * FROM users WHERE user_id = $1`, [userData.userid]);
+  const oldUser = await pool.query(`SELECT * FROM users WHERE user_id = $1`, [userData.user_id]);
   
   // Smart value selection: Don't overwrite good data with zeros
   const getSmartValue = (newVal, oldVal, defaultVal = 0) => {
@@ -58,16 +66,16 @@ async function upsertUser(userData) {
   
   // Prepare values with smart fallback
   const followersCount = oldUser.rows.length > 0
-    ? getSmartValue(userData.followerscount, oldUser.rows[0].followers_count)
-    : (parseInt(userData.followerscount) || 0);
+    ? getSmartValue(userData.followers_count, oldUser.rows[0].followers_count)
+    : (parseInt(userData.followers_count) || 0);
     
   const followingCount = oldUser.rows.length > 0
-    ? getSmartValue(userData.followingcount, oldUser.rows[0].following_count)
-    : (parseInt(userData.followingcount) || 0);
+    ? getSmartValue(userData.following_count, oldUser.rows[0].following_count)
+    : (parseInt(userData.following_count) || 0);
     
   const friendsCount = oldUser.rows.length > 0
-    ? getSmartValue(userData.friendscount, oldUser.rows[0].friends_count)
-    : (parseInt(userData.friendscount) || 0);
+    ? getSmartValue(userData.friends_count, oldUser.rows[0].friends_count)
+    : (parseInt(userData.friends_count) || 0);
   
   const query = `
     INSERT INTO users (
@@ -88,14 +96,14 @@ async function upsertUser(userData) {
     RETURNING *`;
   
   const values = [
-    userData.userid,
-    userData.username,
-    userData.useravatar || null,
-    userData.verificationstatus || 'UNVERIFIED',
+    userData.user_id,
+    userData.username || 'Unknown User',
+    userData.user_avatar || null,
+    userData.verification_status || 'UNVERIFIED',
     followersCount,
     followingCount,
     friendsCount,
-    sanitizeSupporterLevel(userData.supporterlevel),
+    sanitizeSupporterLevel(userData.supporter_level),
   ];
   
   try {
@@ -110,6 +118,7 @@ async function upsertUser(userData) {
     return newUser;
   } catch (error) {
     console.error('Error upserting user:', error);
+    console.error('User data:', { user_id: userData.user_id, username: userData.username });
     throw error;
   }
 }
@@ -235,29 +244,29 @@ async function upsertRoom(roomData) {
   `;
   
   const values = [
-    roomData.roomid,
+    roomData.room_id,
     roomData.channel || 'free4talk',
     roomData.platform || 'Free4Talk',
     roomData.topic || 'Anything',
     roomData.language || 'Unknown',
-    roomData.secondlanguage || null,
-    roomData.skilllevel || 'Any Level',
-    roomData.maxcapacity || -1,
-    roomData.allowsunlimited || (roomData.maxcapacity === -1),
-    roomData.islocked || false,
-    roomData.micallowed !== false,
-    roomData.micrequired || false,
-    roomData.almic || 0,
-    roomData.nomic || false,
+    roomData.second_language || null,
+    roomData.skill_level || 'Any Level',
+    roomData.max_capacity || -1,
+    roomData.allows_unlimited || (roomData.max_capacity === -1),
+    roomData.is_locked || false,
+    roomData.mic_allowed !== false,
+    roomData.mic_required || false,
+    roomData.al_mic || 0,
+    roomData.no_mic || false,
     roomData.url || null,
-    roomData.creatoruserid || null,
-    roomData.creatorname || null,
-    roomData.creatoravatar || null,
-    roomData.creatorisverified || false,
-    roomData.isactive !== false,
-    roomData.isfull || false,
-    roomData.isempty || false,
-    roomData.currentuserscount || 0,
+    roomData.creator_user_id || null,
+    roomData.creator_name || null,
+    roomData.creator_avatar || null,
+    roomData.creator_is_verified || false,
+    roomData.is_active !== false,
+    roomData.is_full || false,
+    roomData.is_empty || false,
+    roomData.current_users_count || 0,
   ];
   
   try {
@@ -319,14 +328,14 @@ async function getActiveSessions(roomId) {
 /**
  * Get current participants in a room
  */
-async function getRoomParticipants(roomid) {
+async function getRoomParticipants(room_id) {
   try {
     const result = await pool.query(
       `SELECT u.user_id, u.username, s.session_id
        FROM sessions s
        JOIN users u ON s.user_id = u.user_id
        WHERE s.room_id = $1 AND s.is_currently_active = true`,
-      [roomid]
+      [room_id]
     );
     return result.rows;
   } catch (error) {
@@ -336,6 +345,12 @@ async function getRoomParticipants(roomid) {
 }
 
 async function createSession(sessionData) {
+  // Validate user_id exists
+  if (!sessionData.user_id) {
+    console.warn(`⚠️  Skipping session creation: user_id is null`);
+    return null;
+  }
+  
   const query = `
     INSERT INTO sessions (
       user_id, room_id, joined_at, user_position,
@@ -345,12 +360,12 @@ async function createSession(sessionData) {
   `;
   
   const values = [
-    sessionData.userid,
-    sessionData.roomid,
-    sessionData.joinedat || new Date(),
-    sessionData.userposition || null,
-    sessionData.micwason || false,
-    sessionData.eventtype || 'join',
+    sessionData.user_id,
+    sessionData.room_id,
+    sessionData.joined_at || new Date(),
+    sessionData.user_position || null,
+    sessionData.mic_was_on || false,
+    sessionData.event_type || 'join',
     true
   ];
   
@@ -362,9 +377,9 @@ async function createSession(sessionData) {
       `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
        VALUES ($1, $2, $3)`,
       [
-        sessionData.userid,
+        sessionData.user_id,
         'room_join',
-        JSON.stringify({ room_id: sessionData.roomid, joined_at: sessionData.joinedat })
+        JSON.stringify({ room_id: sessionData.room_id, joined_at: sessionData.joined_at })
       ]
     );
     
