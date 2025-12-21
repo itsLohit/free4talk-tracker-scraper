@@ -23,15 +23,13 @@ pool.on('error', (err) => {
 function sanitizeSupporterLevel(value) {
   if (value === null || value === undefined) return 0;
   
-  // If it's a timestamp (too large), extract a reasonable level
   const num = parseInt(value);
   if (isNaN(num)) return 0;
   
   // PostgreSQL INTEGER max is 2147483647
-  // If value is too large (likely a timestamp), return 0
   if (num > 2147483647 || num < -2147483648) {
     return 0;
-  }  // ✅ FIXED: Added missing closing brace
+  }
   
   // Ensure it's between 0 and 10 (typical supporter levels)
   return Math.max(0, Math.min(10, num));
@@ -201,65 +199,65 @@ async function logUserProfileChanges(oldUser, newUser) {
 async function upsertRoom(roomData) {
   const query = `
     INSERT INTO rooms (
-      room_id, channel, platform, topic, language, second_language,
-      skill_level, max_capacity, allows_unlimited, is_locked,
-      mic_allowed, mic_required, al_mic, no_mic,
-      url, creator_user_id, creator_name, creator_avatar, creator_is_verified,
-      is_active, is_full, is_empty, current_users_count,
-      first_seen, last_activity
+      roomid, channel, platform, topic, language, secondlanguage,
+      skilllevel, maxcapacity, allowsunlimited, islocked,
+      micallowed, micrequired, almic, nomic,
+      url, creatoruserid, creatorname, creatoravatar, creatorisverified,
+      isactive, isfull, isempty, currentuserscount,
+      firstseen, lastactivity
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, NOW(), NOW())
-    ON CONFLICT (room_id) DO UPDATE SET
+    ON CONFLICT (roomid) DO UPDATE SET
       channel = EXCLUDED.channel,
       platform = EXCLUDED.platform,
       topic = EXCLUDED.topic,
       language = EXCLUDED.language,
-      second_language = EXCLUDED.second_language,
-      skill_level = EXCLUDED.skill_level,
-      max_capacity = EXCLUDED.max_capacity,
-      allows_unlimited = EXCLUDED.allows_unlimited,
-      is_locked = EXCLUDED.is_locked,
-      mic_allowed = EXCLUDED.mic_allowed,
-      mic_required = EXCLUDED.mic_required,
-      al_mic = EXCLUDED.al_mic,
-      no_mic = EXCLUDED.no_mic,
+      secondlanguage = EXCLUDED.secondlanguage,
+      skilllevel = EXCLUDED.skilllevel,
+      maxcapacity = EXCLUDED.maxcapacity,
+      allowsunlimited = EXCLUDED.allowsunlimited,
+      islocked = EXCLUDED.islocked,
+      micallowed = EXCLUDED.micallowed,
+      micrequired = EXCLUDED.micrequired,
+      almic = EXCLUDED.almic,
+      nomic = EXCLUDED.nomic,
       url = EXCLUDED.url,
-      creator_user_id = EXCLUDED.creator_user_id,
-      creator_name = EXCLUDED.creator_name,
-      creator_avatar = EXCLUDED.creator_avatar,
-      creator_is_verified = EXCLUDED.creator_is_verified,
-      is_active = EXCLUDED.is_active,
-      is_full = EXCLUDED.is_full,
-      is_empty = EXCLUDED.is_empty,
-      current_users_count = EXCLUDED.current_users_count,
-      last_activity = NOW(),
-      updated_at = NOW()
-    RETURNING room_id;
+      creatoruserid = EXCLUDED.creatoruserid,
+      creatorname = EXCLUDED.creatorname,
+      creatoravatar = EXCLUDED.creatoravatar,
+      creatorisverified = EXCLUDED.creatorisverified,
+      isactive = EXCLUDED.isactive,
+      isfull = EXCLUDED.isfull,
+      isempty = EXCLUDED.isempty,
+      currentuserscount = EXCLUDED.currentuserscount,
+      lastactivity = NOW(),
+      updatedat = NOW()
+    RETURNING roomid;
   `;
   
   const values = [
-    roomData.room_id,
+    roomData.roomid,
     roomData.channel || 'free4talk',
     roomData.platform || 'Free4Talk',
     roomData.topic || 'Anything',
     roomData.language || 'Unknown',
-    roomData.second_language || null,
-    roomData.skill_level || 'Any Level',
-    roomData.max_capacity || -1,
-    roomData.allows_unlimited || (roomData.max_capacity === -1),
-    roomData.is_locked || false,
-    roomData.mic_allowed !== false,
-    roomData.mic_required || false,
-    roomData.al_mic || 0,
-    roomData.no_mic || false,
+    roomData.secondlanguage || null,
+    roomData.skilllevel || 'Any Level',
+    roomData.maxcapacity || -1,
+    roomData.allowsunlimited || (roomData.maxcapacity === -1),
+    roomData.islocked || false,
+    roomData.micallowed !== false,
+    roomData.micrequired || false,
+    roomData.almic || 0,
+    roomData.nomic || false,
     roomData.url || null,
-    roomData.creator_user_id || null,
-    roomData.creator_name || null,
-    roomData.creator_avatar || null,
-    roomData.creator_is_verified || false,
-    roomData.is_active !== false,
-    roomData.is_full || false,
-    roomData.is_empty || false,
-    roomData.current_users_count || 0,
+    roomData.creatoruserid || null,
+    roomData.creatorname || null,
+    roomData.creatoravatar || null,
+    roomData.creatorisverified || false,
+    roomData.isactive !== false,
+    roomData.isfull || false,
+    roomData.isempty || false,
+    roomData.currentuserscount || 0,
   ];
   
   try {
@@ -276,10 +274,10 @@ async function upsertRoom(roomData) {
  */
 async function createRoomSnapshot(roomId, participants) {
   const query = `
-    INSERT INTO room_snapshots (
-      room_id, snapshot_time, participants_count, participants_json, is_active
+    INSERT INTO roomsnapshots (
+      roomid, snapshottime, participantscount, participantsjson, isactive
     ) VALUES ($1, NOW(), $2, $3, $4)
-    RETURNING snapshot_id;
+    RETURNING snapshotid;
   `;
   
   const values = [
@@ -304,9 +302,9 @@ async function createRoomSnapshot(roomId, participants) {
 
 async function getActiveSessions(roomId) {
   const query = `
-    SELECT session_id, user_id, room_id, joined_at
+    SELECT sessionid, userid, roomid, joinedat
     FROM sessions
-    WHERE room_id = $1 AND is_currently_active = true;
+    WHERE roomid = $1 AND iscurrentlyactive = true;
   `;
   
   try {
@@ -321,14 +319,14 @@ async function getActiveSessions(roomId) {
 /**
  * Get current participants in a room
  */
-async function getRoomParticipants(room_id) {
+async function getRoomParticipants(roomid) {
   try {
     const result = await pool.query(
-      `SELECT u.user_id, u.username, s.session_id
+      `SELECT u.userid, u.username, s.sessionid
        FROM sessions s
-       JOIN users u ON s.user_id = u.user_id
-       WHERE s.room_id = $1 AND s.is_currently_active = true`,
-      [room_id]
+       JOIN users u ON s.userid = u.userid
+       WHERE s.roomid = $1 AND s.iscurrentlyactive = true`,
+      [roomid]
     );
     return result.rows;
   } catch (error) {
@@ -340,19 +338,19 @@ async function getRoomParticipants(room_id) {
 async function createSession(sessionData) {
   const query = `
     INSERT INTO sessions (
-      user_id, room_id, joined_at, user_position,
-      mic_was_on, event_type, is_currently_active
+      userid, roomid, joinedat, userposition,
+      micwason, eventtype, iscurrentlyactive
     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-    RETURNING session_id;
+    RETURNING sessionid;
   `;
   
   const values = [
-    sessionData.user_id,
-    sessionData.room_id,
-    sessionData.joined_at || new Date(),
-    sessionData.user_position || null,
-    sessionData.mic_was_on || false,
-    sessionData.event_type || 'join',
+    sessionData.userid,
+    sessionData.roomid,
+    sessionData.joinedat || new Date(),
+    sessionData.userposition || null,
+    sessionData.micwason || false,
+    sessionData.eventtype || 'join',
     true
   ];
   
@@ -361,12 +359,12 @@ async function createSession(sessionData) {
     
     // Log activity
     await pool.query(
-      `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
+      `INSERT INTO user_activity_log (userid, activitytype, activitydata)
        VALUES ($1, $2, $3)`,
       [
-        sessionData.user_id,
+        sessionData.userid,
         'room_join',
-        JSON.stringify({ room_id: sessionData.room_id, joined_at: sessionData.joined_at })
+        JSON.stringify({ roomid: sessionData.roomid, joinedat: sessionData.joinedat })
       ]
     );
     
@@ -380,12 +378,12 @@ async function createSession(sessionData) {
 async function endAllSessionsInRoom(roomId, userId, leftAt) {
   const query = `
     UPDATE sessions
-    SET left_at = $1,
-        duration_seconds = EXTRACT(EPOCH FROM ($1 - joined_at))::INTEGER,
-        event_type = 'leave',
-        is_currently_active = false
-    WHERE room_id = $2 AND user_id = $3 AND left_at IS NULL
-    RETURNING session_id, duration_seconds;
+    SET leftat = $1,
+        durationseconds = EXTRACT(EPOCH FROM ($1 - joinedat))::INTEGER,
+        eventtype = 'leave',
+        iscurrentlyactive = false
+    WHERE roomid = $2 AND userid = $3 AND leftat IS NULL
+    RETURNING sessionid, durationseconds;
   `;
   
   try {
@@ -394,15 +392,15 @@ async function endAllSessionsInRoom(roomId, userId, leftAt) {
     // Log activity if sessions were ended
     if (result.rows.length > 0) {
       await pool.query(
-        `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
+        `INSERT INTO user_activity_log (userid, activitytype, activitydata)
          VALUES ($1, $2, $3)`,
         [
           userId,
           'room_leave',
           JSON.stringify({
-            room_id: roomId,
-            left_at: leftAt,
-            sessions_ended: result.rows.length
+            roomid: roomId,
+            leftat: leftAt,
+            sessionsended: result.rows.length
           })
         ]
       );
@@ -422,13 +420,13 @@ async function endAllSessionsInRoom(roomId, userId, leftAt) {
 async function getStats() {
   const query = `
     SELECT
-      (SELECT COUNT(*) FROM users) as total_users,
-      (SELECT COUNT(*) FROM rooms) as total_rooms,
-      (SELECT COUNT(*) FROM rooms WHERE is_active = true) as active_rooms,
-      (SELECT COUNT(*) FROM sessions WHERE is_currently_active = true) as active_sessions,
-      (SELECT COUNT(*) FROM sessions) as total_sessions,
-      (SELECT COUNT(*) FROM profile_views WHERE viewed_at >= NOW() - INTERVAL '24 hours') as views_24h,
-      (SELECT COUNT(*) FROM room_snapshots) as total_snapshots
+      (SELECT COUNT(*) FROM users) as totalusers,
+      (SELECT COUNT(*) FROM rooms) as totalrooms,
+      (SELECT COUNT(*) FROM rooms WHERE isactive = true) as activerooms,
+      (SELECT COUNT(*) FROM sessions WHERE iscurrentlyactive = true) as activesessions,
+      (SELECT COUNT(*) FROM sessions) as totalsessions,
+      (SELECT COUNT(*) FROM profileviews WHERE viewedat >= NOW() - INTERVAL '24 hours') as views24h,
+      (SELECT COUNT(*) FROM roomsnapshots) as totalsnapshots
   `;
   
   try {
@@ -445,9 +443,9 @@ async function getStats() {
  */
 async function recordProfileView(userId, viewerIp, viewerUserAgent) {
   const query = `
-    INSERT INTO profile_views (viewed_user_id, viewer_ip, viewer_user_agent, viewed_at)
+    INSERT INTO profileviews (vieweduserid, viewerip, vieweruseragent, viewedat)
     VALUES ($1, $2, $3, NOW())
-    RETURNING view_id;
+    RETURNING viewid;
   `;
   
   try {
@@ -460,48 +458,48 @@ async function recordProfileView(userId, viewerIp, viewerUserAgent) {
 }
 
 /**
- * Update daily room analytics (FIXED)
+ * Update daily room analytics
  */
 async function updateRoomAnalytics(roomId) {
   const query = `
-    INSERT INTO room_analytics (
-      room_id,
+    INSERT INTO roomanalytics (
+      roomid,
       date,
-      total_participants,
-      unique_participants,
-      total_sessions,
-      avg_session_duration_seconds,
-      peak_concurrent_users
+      totalparticipants,
+      uniqueparticipants,
+      totalsessions,
+      avgsessiondurationseconds,
+      peakconcurrentusers
     )
     SELECT
       $1::VARCHAR,
       CURRENT_DATE,
-      COUNT(*) as total_participants,
-      COUNT(DISTINCT user_id) as unique_participants,
-      COUNT(*) as total_sessions,
-      COALESCE(AVG(COALESCE(duration_seconds, 0)), 0)::REAL as avg_duration,
+      COUNT(*) as totalparticipants,
+      COUNT(DISTINCT userid) as uniqueparticipants,
+      COUNT(*) as totalsessions,
+      COALESCE(AVG(COALESCE(durationseconds, 0)), 0)::REAL as avgduration,
       COALESCE((
-        SELECT MAX(concurrent_count)
+        SELECT MAX(concurrentcount)
         FROM (
           SELECT
-            DATE_TRUNC('minute', joined_at) as time_slot,
-            COUNT(*) as concurrent_count
+            DATE_TRUNC('minute', joinedat) as timeslot,
+            COUNT(*) as concurrentcount
           FROM sessions
-          WHERE room_id = $1::VARCHAR
-            AND DATE(joined_at) = CURRENT_DATE
-            AND (is_currently_active = true OR left_at IS NOT NULL)
-          GROUP BY DATE_TRUNC('minute', joined_at)
+          WHERE roomid = $1::VARCHAR
+            AND DATE(joinedat) = CURRENT_DATE
+            AND (iscurrentlyactive = true OR leftat IS NOT NULL)
+          GROUP BY DATE_TRUNC('minute', joinedat)
         ) subq
-      ), 0) as peak_concurrent
+      ), 0) as peakconcurrent
     FROM sessions
-    WHERE room_id = $1::VARCHAR
-      AND DATE(joined_at) = CURRENT_DATE
-    ON CONFLICT (room_id, date) DO UPDATE SET
-      total_participants = EXCLUDED.total_participants,
-      unique_participants = EXCLUDED.unique_participants,
-      total_sessions = EXCLUDED.total_sessions,
-      avg_session_duration_seconds = EXCLUDED.avg_session_duration_seconds,
-      peak_concurrent_users = EXCLUDED.peak_concurrent_users;
+    WHERE roomid = $1::VARCHAR
+      AND DATE(joinedat) = CURRENT_DATE
+    ON CONFLICT (roomid, date) DO UPDATE SET
+      totalparticipants = EXCLUDED.totalparticipants,
+      uniqueparticipants = EXCLUDED.uniqueparticipants,
+      totalsessions = EXCLUDED.totalsessions,
+      avgsessiondurationseconds = EXCLUDED.avgsessiondurationseconds,
+      peakconcurrentusers = EXCLUDED.peakconcurrentusers;
   `;
   
   try {
@@ -520,10 +518,10 @@ async function markInactiveRooms(activeRoomIds) {
   
   const query = `
     UPDATE rooms
-    SET is_active = false, updated_at = NOW()
-    WHERE is_active = true
-      AND room_id NOT IN (${activeRoomIds.map((_, i) => `$${i + 1}`).join(',')})
-    RETURNING room_id;
+    SET isactive = false, updatedat = NOW()
+    WHERE isactive = true
+      AND roomid NOT IN (${activeRoomIds.map((_, i) => `$${i + 1}`).join(',')})
+    RETURNING roomid;
   `;
   
   try {
