@@ -1,523 +1,403 @@
+// db.js - FIXED VERSION
 const { Pool } = require('pg');
 const config = require('./config');
 
-// Create connection pool
-const pool = new Pool(config.db);
-
-// Test connection
-pool.on('connect', () => {
-  console.log('✅ Connected to PostgreSQL database');
-});
-
-pool.on('error', (err) => {
-  console.error('❌ Database error:', err);
-});
-
-// ============================================
-// USER QUERIES (ENHANCED WITH HISTORY TRACKING)
-// ============================================
-
-/**
- * Sanitize supporter level to ensure it's a valid integer
- */
-function sanitizeSupporterLevel(value) {
-  if (value === null || value === undefined) return 0;
-  const num = parseInt(value);
-  if (isNaN(num)) return 0;
-  // PostgreSQL INTEGER max is 2147483647
-  if (num > 2147483647 || num < -2147483648) return 0;
-  // Ensure it's between 0 and 10 (typical supporter levels)
-  return Math.max(0, Math.min(10, num));
-}
-
-/**
- * Upsert user with full social metrics and history tracking
- */
-async function upsertUser(userData) {
-  if (!userData.user_id) {
-    console.warn(`⚠️ Skipping user insert: user_id is null or undefined for username "${userData.username || 'unknown'}"`);
-    return null;
+class Database {
+  constructor() {
+    this.pool = new Pool({
+      connectionString: config.DATABASE_URL,
+      ssl: config.DATABASE_URL.includes('aiven') ? { rejectUnauthorized: false } : false
+    });
   }
 
-  const oldUser = await pool.query(`SELECT * FROM users WHERE user_id = $1`, [userData.user_id]);
+  async connect() {
+    try {
+      const client = await this.pool.connect();
+      console.log('✅ Connected to PostgreSQL database');
+      client.release();
+      return true;
+    } catch (error) {
+      console.error('❌ Database connection error:', error.message);
+      throw error;
+    }
+  }
 
-  const getSmartValue = (newVal, oldVal, defaultVal = 0) => {
-    const parsedNew = parseInt(newVal) || 0;
-    const parsedOld = parseInt(oldVal) || 0;
-    if (parsedNew === 0 && parsedOld > 0) return parsedOld;
-    return parsedNew || defaultVal;
-  };
+  /**
+   * FIXED: Upsert user with proper update logic
+   */
+  async upsertUser(userData) {
+    const {
+      username,
+      displayName,
+      avatarUrl,
+      bio,
+      followerCount,
+      followingCount,
+      friendsCount,
+      gender,
+      languages,
+      interests
+    } = userData;
 
-  const followersCount = oldUser.rows.length > 0
-    ? getSmartValue(userData.followers_count, oldUser.rows[0].followers_count)
-    : (parseInt(userData.followers_count) || 0);
-  const followingCount = oldUser.rows.length > 0
-    ? getSmartValue(userData.following_count, oldUser.rows[0].following_count)
-    : (parseInt(userData.following_count) || 0);
-  const friendsCount = oldUser.rows.length > 0
-    ? getSmartValue(userData.friends_count, oldUser.rows[0].friends_count)
-    : (parseInt(userData.friends_count) || 0);
+    // First, try to INSERT
+    const insertQuery = `
+      INSERT INTO users (
+        username, display_name, avatar_url, bio, 
+        follower_count, following_count, friends_count, 
+        gender, languages, interests, last_active
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+      ON CONFLICT (username) DO NOTHING
+      RETURNING *
+    `;
 
-  const query = `
-    INSERT INTO users (
-      user_id, username, user_avatar, verification_status,
-      followers_count, following_count, friends_count, supporter_level,
-      first_seen, last_seen
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-    ON CONFLICT (user_id) DO UPDATE SET
-      username = EXCLUDED.username,
-      user_avatar = EXCLUDED.user_avatar,
-      verification_status = EXCLUDED.verification_status,
-      followers_count = EXCLUDED.followers_count,
-      following_count = EXCLUDED.following_count,
-      friends_count = EXCLUDED.friends_count,
-      supporter_level = EXCLUDED.supporter_level,
-      last_seen = NOW(),
-      updated_at = NOW()
-    RETURNING *`;
+    const values = [
+      username,
+      displayName || username,
+      avatarUrl,
+      bio,
+      followerCount || 0,
+      followingCount || 0,
+      friendsCount || 0,
+      gender,
+      languages || [],
+      interests || []
+    ];
 
-  const values = [
-    userData.user_id,
-    userData.username || 'Unknown User',
-    userData.user_avatar || null,
-    userData.verification_status || 'UNVERIFIED',
-    followersCount,
-    followingCount,
-    friendsCount,
-    sanitizeSupporterLevel(userData.supporter_level),
-  ];
+    try {
+      const insertResult = await this.pool.query(insertQuery, values);
 
-  try {
-    const result = await pool.query(query, values);
-    const newUser = result.rows[0];
+      // If insert succeeded, return the new row
+      if (insertResult.rowCount > 0) {
+        console.log(`✅ Inserted new user: ${username}`);
+        return insertResult.rows[0];
+      }
 
-    if (oldUser.rows.length > 0) {
-      await logUserProfileChanges(oldUser.rows[0], newUser);
+      // Otherwise, UPDATE the existing row
+      const updateQuery = `
+        UPDATE users SET
+          display_name = $2,
+          avatar_url = $3,
+          bio = $4,
+          follower_count = $5,
+          following_count = $6,
+          friends_count = $7,
+          gender = $8,
+          languages = $9,
+          interests = $10,
+          last_active = NOW(),
+          updated_at = NOW()
+        WHERE username = $1
+        RETURNING *
+      `;
+
+      const updateResult = await this.pool.query(updateQuery, values);
+
+      if (updateResult.rowCount > 0) {
+        console.log(`🔄 Updated user: ${username} (${followerCount} followers)`);
+        return updateResult.rows[0];
+      }
+
+      throw new Error(`Failed to upsert user ${username}`);
+
+    } catch (error) {
+      console.error(`❌ Error upserting user ${username}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * NEW: Add or update a user relationship
+   */
+  async upsertRelationship(username, relatedUsername, type) {
+    const query = `
+      WITH user_ids AS (
+        SELECT 
+          u1.id as user_id,
+          u2.id as related_user_id
+        FROM users u1
+        CROSS JOIN users u2
+        WHERE u1.username = $1 AND u2.username = $2
+      )
+      INSERT INTO user_relationships (user_id, related_user_id, relationship_type)
+      SELECT user_id, related_user_id, $3
+      FROM user_ids
+      ON CONFLICT (user_id, related_user_id, relationship_type) 
+      DO UPDATE SET created_at = NOW()
+      RETURNING *
+    `;
+
+    try {
+      const result = await this.pool.query(query, [username, relatedUsername, type]);
+      return result.rows[0];
+    } catch (error) {
+      console.error(`Error adding ${type} relationship ${username} -> ${relatedUsername}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * NEW: Bulk insert relationships (more efficient)
+   */
+  async bulkInsertRelationships(username, relatedUsernames, type) {
+    if (!relatedUsernames || relatedUsernames.length === 0) {
+      return 0;
     }
 
-    return newUser;
-  } catch (error) {
-    console.error('Error upserting user:', error);
-    console.error('User data:', { user_id: userData.user_id, username: userData.username });
-    throw error;
-  }
-}
+    const query = `
+      WITH user_id AS (
+        SELECT id FROM users WHERE username = $1
+      ),
+      related_ids AS (
+        SELECT id, username FROM users WHERE username = ANY($2)
+      )
+      INSERT INTO user_relationships (user_id, related_user_id, relationship_type)
+      SELECT user_id.id, related_ids.id, $3
+      FROM user_id
+      CROSS JOIN related_ids
+      ON CONFLICT (user_id, related_user_id, relationship_type) DO NOTHING
+    `;
 
-/**
- * Log user profile changes for history tracking
- */
-async function logUserProfileChanges(oldUser, newUser) {
-  const changes = {};
-
-  const isValidChange = (oldVal, newVal) => {
-    if (newVal === 0 && oldVal > 0) return false;
-    if (oldVal === 0 && newVal === 0) return false;
-    return oldVal !== newVal;
-  };
-
-  if (isValidChange(oldUser.followers_count, newUser.followers_count)) {
-    changes.followers_count = {
-      old: oldUser.followers_count,
-      new: newUser.followers_count,
-      diff: newUser.followers_count - oldUser.followers_count
-    };
+    try {
+      const result = await this.pool.query(query, [username, relatedUsernames, type]);
+      console.log(`✅ Added ${result.rowCount} ${type} relationships for ${username}`);
+      return result.rowCount;
+    } catch (error) {
+      console.error(`Error bulk inserting ${type} for ${username}:`, error.message);
+      return 0;
+    }
   }
 
-  if (isValidChange(oldUser.following_count, newUser.following_count)) {
-    changes.following_count = {
-      old: oldUser.following_count,
-      new: newUser.following_count,
-      diff: newUser.following_count - oldUser.following_count
-    };
+  /**
+   * Upsert a room
+   */
+  async upsertRoom(roomData) {
+    const { roomId, roomName, topic, language, isPublic, participantCount, createdBy } = roomData;
+
+    const query = `
+      INSERT INTO rooms (room_id, room_name, topic, language, is_public, participant_count, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (room_id) 
+      DO UPDATE SET
+        room_name = EXCLUDED.room_name,
+        topic = EXCLUDED.topic,
+        language = EXCLUDED.language,
+        participant_count = EXCLUDED.participant_count,
+        last_active = NOW(),
+        updated_at = NOW()
+      RETURNING *
+    `;
+
+    try {
+      const result = await this.pool.query(query, [
+        roomId, roomName, topic, language, isPublic !== false, participantCount || 0, createdBy
+      ]);
+      return result.rows[0];
+    } catch (error) {
+      console.error(`Error upserting room ${roomId}:`, error.message);
+      throw error;
+    }
   }
 
-  if (isValidChange(oldUser.friends_count, newUser.friends_count)) {
-    changes.friends_count = {
-      old: oldUser.friends_count,
-      new: newUser.friends_count,
-      diff: newUser.friends_count - oldUser.friends_count
-    };
+  /**
+   * NEW: Add room participant
+   */
+  async addRoomParticipant(roomId, username, role = 'listener') {
+    const query = `
+      WITH room_user AS (
+        SELECT r.id as room_id, u.id as user_id
+        FROM rooms r
+        CROSS JOIN users u
+        WHERE r.room_id = $1 AND u.username = $2
+      )
+      INSERT INTO room_participants (room_id, user_id, role)
+      SELECT room_id, user_id, $3
+      FROM room_user
+      ON CONFLICT (room_id, user_id, joined_at) DO NOTHING
+      RETURNING *
+    `;
+
+    try {
+      const result = await this.pool.query(query, [roomId, username, role]);
+      return result.rows[0];
+    } catch (error) {
+      console.error(`Error adding participant ${username} to room ${roomId}:`, error.message);
+      return null;
+    }
   }
 
-  if (oldUser.supporter_level !== newUser.supporter_level && newUser.supporter_level > 0) {
-    changes.supporter_level = {
-      old: oldUser.supporter_level,
-      new: newUser.supporter_level,
-      diff: newUser.supporter_level - oldUser.supporter_level
-    };
-  }
-
-  if (oldUser.username !== newUser.username) {
-    changes.username = {
-      old: oldUser.username,
-      new: newUser.username
-    };
-  }
-
-  if (oldUser.verification_status !== newUser.verification_status) {
-    changes.verification_status = {
-      old: oldUser.verification_status,
-      new: newUser.verification_status
-    };
-  }
-
-  if (Object.keys(changes).length > 0) {
-    await pool.query(
-      `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
-       VALUES ($1, $2, $3)`,
-      [newUser.user_id, 'profile_update', JSON.stringify(changes)]
-    );
-  }
-}
-
-// ============================================
-// ROOM QUERIES (ENHANCED WITH FULL API DATA)
-// ============================================
-
-async function upsertRoom(roomData) {
-  const query = `
-    INSERT INTO rooms (
-      room_id, channel, platform, topic, language, second_language,
-      skill_level, max_capacity, allows_unlimited, is_locked,
-      mic_allowed, mic_required, al_mic, no_mic,
-      url, creator_user_id, creator_name, creator_avatar, creator_is_verified,
-      is_active, is_full, is_empty, current_users_count,
-      first_seen, last_activity
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, NOW(), NOW())
-    ON CONFLICT (room_id) DO UPDATE SET
-      channel = EXCLUDED.channel,
-      platform = EXCLUDED.platform,
-      topic = EXCLUDED.topic,
-      language = EXCLUDED.language,
-      second_language = EXCLUDED.second_language,
-      skill_level = EXCLUDED.skill_level,
-      max_capacity = EXCLUDED.max_capacity,
-      allows_unlimited = EXCLUDED.allows_unlimited,
-      is_locked = EXCLUDED.is_locked,
-      mic_allowed = EXCLUDED.mic_allowed,
-      mic_required = EXCLUDED.mic_required,
-      al_mic = EXCLUDED.al_mic,
-      no_mic = EXCLUDED.no_mic,
-      url = EXCLUDED.url,
-      creator_user_id = EXCLUDED.creator_user_id,
-      creator_name = EXCLUDED.creator_name,
-      creator_avatar = EXCLUDED.creator_avatar,
-      creator_is_verified = EXCLUDED.creator_is_verified,
-      is_active = EXCLUDED.is_active,
-      is_full = EXCLUDED.is_full,
-      is_empty = EXCLUDED.is_empty,
-      current_users_count = EXCLUDED.current_users_count,
-      last_activity = NOW(),
-      updated_at = NOW()
-    RETURNING room_id;
-  `;
-
-  const values = [
-    roomData.room_id,
-    roomData.channel || 'free4talk',
-    roomData.platform || 'Free4Talk',
-    roomData.topic || 'Anything',
-    roomData.language || 'Unknown',
-    roomData.second_language || null,
-    roomData.skill_level || 'Any Level',
-    roomData.max_capacity || -1,
-    roomData.allows_unlimited || (roomData.max_capacity === -1),
-    roomData.is_locked || false,
-    roomData.mic_allowed !== false,
-    roomData.mic_required || false,
-    roomData.al_mic || 0,
-    roomData.no_mic || false,
-    roomData.url || null,
-    roomData.creator_user_id || null,
-    roomData.creator_name || null,
-    roomData.creator_avatar || null,
-    roomData.creator_is_verified || false,
-    roomData.is_active !== false,
-    roomData.is_full || false,
-    roomData.is_empty || false,
-    roomData.current_users_count || 0,
-  ];
-
-  try {
-    const result = await pool.query(query, values);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error upserting room:', error);
-    throw error;
-  }
-}
-
-async function createRoomSnapshot(roomId, participants) {
-  const query = `
-    INSERT INTO room_snapshots (
-      room_id, snapshot_time, participants_count, participants_json, is_active
-    ) VALUES ($1, NOW(), $2, $3, $4)
-    RETURNING snapshot_id;
-  `;
-
-  const values = [
-    roomId,
-    participants.length,
-    JSON.stringify(participants),
-    true
-  ];
-
-  try {
-    const result = await pool.query(query, values);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error creating room snapshot:', error);
-    throw error;
-  }
-}
-
-// ============================================
-// SESSION QUERIES
-// ============================================
-
-async function getActiveSessions(roomId) {
-  const query = `
-    SELECT session_id, user_id, room_id, joined_at
-    FROM sessions
-    WHERE room_id = $1 AND is_currently_active = true;
-  `;
-
-  try {
-    const result = await pool.query(query, [roomId]);
-    return result.rows;
-  } catch (error) {
-    console.error('Error getting active sessions:', error);
-    throw error;
-  }
-}
-
-async function getRoomParticipants(room_id) {
-  try {
-    const result = await pool.query(
-      `SELECT u.user_id, u.username, s.session_id
-       FROM sessions s
-       JOIN users u ON s.user_id = u.user_id
-       WHERE s.room_id = $1 AND s.is_currently_active = true`,
-      [room_id]
-    );
-    return result.rows;
-  } catch (error) {
-    console.error('Error getting room participants:', error);
-    throw error;
-  }
-}
-
-async function createSession(sessionData) {
-  if (!sessionData.user_id) {
-    console.warn(`⚠️ Skipping session creation: user_id is null`);
-    return null;
-  }
-
-  const query = `
-    INSERT INTO sessions (
-      user_id, room_id, joined_at, user_position,
-      mic_was_on, event_type, is_currently_active
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-    RETURNING session_id;
-  `;
-
-  const values = [
-    sessionData.user_id,
-    sessionData.room_id,
-    sessionData.joined_at || new Date(),
-    sessionData.user_position || null,
-    sessionData.mic_was_on || false,
-    sessionData.event_type || 'join',
-    true
-  ];
-
-  try {
-    const result = await pool.query(query, values);
-
-    await pool.query(
-      `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
-       VALUES ($1, $2, $3)`,
-      [
-        sessionData.user_id,
-        'room_join',
-        JSON.stringify({ room_id: sessionData.room_id, joined_at: sessionData.joined_at })
-      ]
-    );
-
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error creating session:', error);
-    throw error;
-  }
-}
-
-async function endAllSessionsInRoom(roomId, userId, leftAt) {
-  const query = `
-    UPDATE sessions
-    SET left_at = $1,
-        duration_seconds = EXTRACT(EPOCH FROM ($1 - joined_at))::INTEGER,
-        event_type = 'leave',
-        is_currently_active = false
-    WHERE room_id = $2 AND user_id = $3 AND left_at IS NULL
-    RETURNING session_id, duration_seconds;
-  `;
-
-  try {
-    const result = await pool.query(query, [leftAt || new Date(), roomId, userId]);
-
-    if (result.rows.length > 0) {
-      await pool.query(
-        `INSERT INTO user_activity_log (user_id, activity_type, activity_data)
-         VALUES ($1, $2, $3)`,
-        [
-          userId,
-          'room_leave',
-          JSON.stringify({
-            room_id: roomId,
-            left_at: leftAt,
-            sessions_ended: result.rows.length
-          })
-        ]
-      );
+  /**
+   * NEW: Bulk add room participants
+   */
+  async bulkAddRoomParticipants(roomId, participants) {
+    if (!participants || participants.length === 0) {
+      return 0;
     }
 
-    return result.rows;
-  } catch (error) {
-    console.error('Error ending sessions:', error);
-    throw error;
+    const query = `
+      WITH room_id_lookup AS (
+        SELECT id FROM rooms WHERE room_id = $1
+      ),
+      user_data AS (
+        SELECT unnest($2::text[]) as username, unnest($3::text[]) as role
+      ),
+      user_ids AS (
+        SELECT u.id, ud.role
+        FROM users u
+        JOIN user_data ud ON u.username = ud.username
+      )
+      INSERT INTO room_participants (room_id, user_id, role)
+      SELECT room_id_lookup.id, user_ids.id, user_ids.role
+      FROM room_id_lookup
+      CROSS JOIN user_ids
+      ON CONFLICT (room_id, user_id, joined_at) DO NOTHING
+    `;
+
+    try {
+      const usernames = participants.map(p => p.username);
+      const roles = participants.map(p => p.role || 'listener');
+
+      const result = await this.pool.query(query, [roomId, usernames, roles]);
+      console.log(`✅ Added ${result.rowCount} participants to room ${roomId}`);
+      return result.rowCount;
+    } catch (error) {
+      console.error(`Error bulk adding participants to room ${roomId}:`, error.message);
+      return 0;
+    }
+  }
+
+  /**
+   * Create or update a session
+   */
+  async upsertSession(sessionData) {
+    const { username, roomId, joinedAt, leftAt, duration } = sessionData;
+
+    const query = `
+      WITH user_room AS (
+        SELECT u.id as user_id, r.id as room_id
+        FROM users u
+        CROSS JOIN rooms r
+        WHERE u.username = $1 AND r.room_id = $2
+      )
+      INSERT INTO sessions (user_id, room_id, joined_at, left_at, duration)
+      SELECT user_id, room_id, $3, $4, $5
+      FROM user_room
+      RETURNING *
+    `;
+
+    try {
+      const result = await this.pool.query(query, [
+        username,
+        roomId,
+        joinedAt || new Date(),
+        leftAt,
+        duration
+      ]);
+      return result.rows[0];
+    } catch (error) {
+      console.error('Error upserting session:', error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get user by username
+   */
+  async getUserByUsername(username) {
+    const query = 'SELECT * FROM users WHERE username = $1';
+    try {
+      const result = await this.pool.query(query, [username]);
+      return result.rows[0] || null;
+    } catch (error) {
+      console.error(`Error getting user ${username}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get all users
+   */
+  async getAllUsers(limit = 100) {
+    const query = 'SELECT * FROM users ORDER BY last_active DESC LIMIT $1';
+    try {
+      const result = await this.pool.query(query, [limit]);
+      return result.rows;
+    } catch (error) {
+      console.error('Error getting all users:', error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Get user relationships
+   */
+  async getUserRelationships(username, type) {
+    const query = `
+      SELECT u2.username, u2.display_name, u2.avatar_url, ur.created_at
+      FROM user_relationships ur
+      JOIN users u1 ON ur.user_id = u1.id
+      JOIN users u2 ON ur.related_user_id = u2.id
+      WHERE u1.username = $1 AND ur.relationship_type = $2
+      ORDER BY ur.created_at DESC
+    `;
+
+    try {
+      const result = await this.pool.query(query, [username, type]);
+      return result.rows;
+    } catch (error) {
+      console.error(`Error getting ${type} for ${username}:`, error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Get room participants
+   */
+  async getRoomParticipants(roomId) {
+    const query = `
+      SELECT u.username, u.display_name, u.avatar_url, rp.role, rp.joined_at
+      FROM room_participants rp
+      JOIN rooms r ON rp.room_id = r.id
+      JOIN users u ON rp.user_id = u.id
+      WHERE r.room_id = $1 AND rp.left_at IS NULL
+      ORDER BY rp.joined_at DESC
+    `;
+
+    try {
+      const result = await this.pool.query(query, [roomId]);
+      return result.rows;
+    } catch (error) {
+      console.error(`Error getting participants for room ${roomId}:`, error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Get database statistics
+   */
+  async getStats() {
+    const query = `
+      SELECT 
+        (SELECT COUNT(*) FROM users) as user_count,
+        (SELECT COUNT(*) FROM rooms) as room_count,
+        (SELECT COUNT(*) FROM sessions) as session_count,
+        (SELECT COUNT(*) FROM user_relationships) as relationship_count,
+        (SELECT COUNT(*) FROM room_participants WHERE left_at IS NULL) as active_participant_count
+    `;
+
+    try {
+      const result = await this.pool.query(query);
+      return result.rows[0];
+    } catch (error) {
+      console.error('Error getting stats:', error.message);
+      return null;
+    }
+  }
+
+  async close() {
+    await this.pool.end();
+    console.log('🔌 Database connection closed');
   }
 }
 
-// ============================================
-// STATISTICS & ANALYTICS
-// ============================================
-
-async function getStats() {
-  const query = `
-    SELECT
-      (SELECT COUNT(*) FROM users) as total_users,
-      (SELECT COUNT(*) FROM rooms) as total_rooms,
-      (SELECT COUNT(*) FROM rooms WHERE is_active = true) as active_rooms,
-      (SELECT COUNT(*) FROM sessions WHERE is_currently_active = true) as active_sessions,
-      (SELECT COUNT(*) FROM sessions) as total_sessions,
-      (SELECT COUNT(*) FROM profile_views WHERE viewed_at >= NOW() - INTERVAL '24 hours') as views_24h,
-      (SELECT COUNT(*) FROM room_snapshots) as total_snapshots
-  `;
-
-  try {
-    const result = await pool.query(query);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error getting stats:', error);
-    throw error;
-  }
-}
-
-async function recordProfileView(userId, viewerIp, viewerUserAgent) {
-  const query = `
-    INSERT INTO profile_views (viewed_user_id, viewer_ip, viewer_user_agent, viewed_at)
-    VALUES ($1, $2, $3, NOW())
-    RETURNING view_id;
-  `;
-
-  try {
-    const result = await pool.query(query, [userId, viewerIp, viewerUserAgent]);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error recording profile view:', error);
-    throw error;
-  }
-}
-
-async function updateRoomAnalytics(roomId) {
-  const query = `
-    INSERT INTO room_analytics (
-      room_id,
-      date,
-      total_participants,
-      unique_participants,
-      total_sessions,
-      avg_session_duration_seconds,
-      peak_concurrent_users
-    )
-    SELECT
-      $1::VARCHAR,
-      CURRENT_DATE,
-      COUNT(*) as total_participants,
-      COUNT(DISTINCT user_id) as unique_participants,
-      COUNT(*) as total_sessions,
-      COALESCE(AVG(COALESCE(duration_seconds, 0)), 0)::REAL as avg_duration,
-      COALESCE((
-        SELECT MAX(concurrent_count)
-        FROM (
-          SELECT
-            DATE_TRUNC('minute', joined_at) as time_slot,
-            COUNT(*) as concurrent_count
-          FROM sessions
-          WHERE room_id = $1::VARCHAR
-            AND DATE(joined_at) = CURRENT_DATE
-            AND (is_currently_active = true OR left_at IS NOT NULL)
-          GROUP BY DATE_TRUNC('minute', joined_at)
-        ) subq
-      ), 0) as peak_concurrent
-    FROM sessions
-    WHERE room_id = $1::VARCHAR
-      AND DATE(joined_at) = CURRENT_DATE
-    ON CONFLICT (room_id, date) DO UPDATE SET
-      total_participants = EXCLUDED.total_participants,
-      unique_participants = EXCLUDED.unique_participants,
-      total_sessions = EXCLUDED.total_sessions,
-      avg_session_duration_seconds = EXCLUDED.avg_session_duration_seconds,
-      peak_concurrent_users = EXCLUDED.peak_concurrent_users;
-  `;
-
-  try {
-    await pool.query(query, [roomId]);
-  } catch (error) {
-    console.error('Error updating room analytics:', error);
-  }
-}
-
-async function markInactiveRooms(activeRoomIds) {
-  if (activeRoomIds.length === 0) return;
-
-  const query = `
-    UPDATE rooms
-    SET is_active = false, updated_at = NOW()
-    WHERE is_active = true
-      AND room_id NOT IN (${activeRoomIds.map((_, i) => `$${i + 1}`).join(',')})
-    RETURNING room_id;
-  `;
-
-  try {
-    const result = await pool.query(query, activeRoomIds);
-    return result.rows;
-  } catch (error) {
-    console.error('Error marking inactive rooms:', error);
-    throw error;
-  }
-}
-
-// ============================================
-// EXPORTS
-// ============================================
-
-module.exports = {
-  pool,
-  // User functions
-  upsertUser,
-  logUserProfileChanges,
-  recordProfileView,
-  // Room functions
-  upsertRoom,
-  createRoomSnapshot,
-  markInactiveRooms,
-  // Session functions
-  getActiveSessions,
-  createSession,
-  endAllSessionsInRoom,
-  getRoomParticipants,
-  // Analytics
-  getStats,
-  updateRoomAnalytics,
-};
+module.exports = Database;

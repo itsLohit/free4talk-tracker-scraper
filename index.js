@@ -1,211 +1,250 @@
-const { chromium } = require('playwright');
-const db = require('./db');
-const SessionTracker = require('./tracker');
+// index.js - FIXED VERSION
+const puppeteer = require('puppeteer');
+const Database = require('./db');
+const Free4TalkTracker = require('./tracker');
+const { parseHomepage } = require('./parser');
 const config = require('./config');
 
-const tracker = new SessionTracker(db.pool);
+class Free4TalkScraper {
+  constructor() {
+    this.browser = null;
+    this.page = null;
+    this.db = null;
+    this.tracker = null;
+  }
 
+  async initialize() {
+    console.log('🚀 Initializing Free4Talk Tracker...');
 
+    // Initialize database
+    this.db = new Database();
+    await this.db.connect();
 
-async function startSmartScraper() {
-    console.log('🚀 Starting Smart Network Interceptor...');
-    console.log('📊 Features enabled:');
-    console.log('   ✓ Auto user profile tracking');
-    console.log('   ✓ Profile change history');
-    console.log('   ✓ Room snapshots every 5 minutes');
-    console.log('   ✓ Activity logging');
-    console.log('   ✓ Daily analytics');
-    console.log('');
-
-    const browser = await chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    // Launch browser
+    this.browser = await puppeteer.launch({
+      headless: config.HEADLESS,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu'
+      ]
     });
 
-    const context = await browser.newContext();
-    const page = await context.newPage();
+    this.page = await this.browser.newPage();
 
-    await tracker.initialize();
+    // Set viewport
+    await this.page.setViewport({ width: 1920, height: 1080 });
 
-    let latestGroups = null;
-    let cycleCount = 0;
+    // Set user agent
+    await this.page.setUserAgent(
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
 
-    // Intercept network responses
-    page.on('response', async response => {
-        const url = response.url();
-        if (url.includes('/sync/get/free4talk/groups/')) {
-            try {
-                const json = await response.json();
-                if (json.success && json.data) {
-                    console.log(`⚡ INTERCEPTED: ${Object.keys(json.data).length} groups from network!`);
-                    latestGroups = json.data;
-                }
-            } catch (err) {
-                // Ignore parse errors
+    // Initialize tracker
+    this.tracker = new Free4TalkTracker(this.page, this.db);
+
+    console.log('✅ Initialization complete');
+  }
+
+  /**
+   * FIXED: Multi-level discovery strategy
+   */
+  async startTracking() {
+    console.log('\n' + '='.repeat(80));
+    console.log('🚀 STARTING FREE4TALK COMPREHENSIVE TRACKING');
+    console.log('='.repeat(80));
+
+    let iteration = 0;
+
+    while (true) {
+      try {
+        iteration++;
+        const startTime = Date.now();
+
+        console.log('\n' + '━'.repeat(80));
+        console.log(`📊 ITERATION ${iteration} - ${new Date().toISOString()}`);
+        console.log('━'.repeat(80));
+
+        // Reset tracking sets for new iteration
+        this.tracker.resetTracking();
+
+        // LEVEL 1: Scrape homepage for initial discovery
+        console.log('\n📍 LEVEL 1: Homepage Discovery');
+        console.log('-'.repeat(80));
+        const homepageUsers = await this.scrapeHomepage();
+        console.log(`✅ Discovered ${homepageUsers.length} users from homepage`);
+
+        // LEVEL 2: Discover users from rooms
+        console.log('\n📍 LEVEL 2: Room Participant Discovery');
+        console.log('-'.repeat(80));
+        const roomUsers = await this.tracker.discoverUsersFromRooms();
+        console.log(`✅ Discovered ${roomUsers.length} users from rooms`);
+
+        // Combine all discovered users
+        const allDiscoveredUsers = new Set([...homepageUsers, ...roomUsers]);
+        console.log(`\n📊 Total unique users discovered: ${allDiscoveredUsers.size}`);
+
+        // LEVEL 3: Deep profile tracking
+        console.log('\n📍 LEVEL 3: Deep Profile Tracking');
+        console.log('-'.repeat(80));
+
+        let tracked = 0;
+        let failed = 0;
+
+        for (const username of allDiscoveredUsers) {
+          try {
+            // Track profile with deep=true for first 20 users (to get relationships)
+            const deep = tracked < 20;
+            const user = await this.tracker.trackUserProfile(username, deep);
+
+            if (user) {
+              tracked++;
+              console.log(`  [${tracked}/${allDiscoveredUsers.size}] ✅ ${username}`);
+            } else {
+              failed++;
+              console.log(`  [${tracked + failed}/${allDiscoveredUsers.size}] ❌ ${username}`);
             }
-        }
-    });
 
-    console.log('🌐 Navigating to Free4Talk...');
-    await page.goto('https://www.free4talk.com/', { waitUntil: 'networkidle' });
+            // Rate limiting
+            await this.sleep(config.RATE_LIMIT_MS || 2000);
 
-    // Main processing loop
-    async function loop() {
-        cycleCount++;
-        const cycleTime = new Date().toLocaleTimeString();
-        console.log(`\n🔄 Cycle #${cycleCount}: ${cycleTime}`);
-
-        if (latestGroups) {
-            console.log('💾 Processing captured data...');
-            await processApiData(latestGroups);
-            latestGroups = null;
-        } else {
-            console.log('⚠️  No new data yet. Waiting...');
+          } catch (error) {
+            failed++;
+            console.error(`  [${tracked + failed}/${allDiscoveredUsers.size}] ❌ ${username}: ${error.message}`);
+          }
         }
 
-        // Show tracker stats
-        const stats = tracker.getStats();
-        console.log(`📈 Tracker: ${stats.activeUsers} users, ${stats.activeSessions} sessions`);
+        // Get statistics
+        const stats = await this.db.getStats();
+        const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
 
-        // Get database stats every 10 cycles
-        if (cycleCount % 10 === 0) {
-            try {
-                const dbStats = await db.getStats();
-                console.log('\n📊 Database Statistics:');
-                console.log(`   Users: ${dbStats.total_users}`);
-                console.log(`   Rooms: ${dbStats.total_rooms} (${dbStats.active_rooms} active)`);
-                console.log(`   Sessions: ${dbStats.total_sessions} (${dbStats.active_sessions} active)`);
-                console.log(`   Profile views (24h): ${dbStats.views_24h}`);
-                console.log(`   Snapshots: ${dbStats.total_snapshots}`);
-            } catch (error) {
-                console.error('Error fetching stats:', error.message);
-            }
-        }
+        console.log('\n' + '━'.repeat(80));
+        console.log('📊 ITERATION SUMMARY');
+        console.log('━'.repeat(80));
+        console.log(`✅ Successfully tracked: ${tracked} users`);
+        console.log(`❌ Failed: ${failed} users`);
+        console.log(`⏱️  Time elapsed: ${elapsed} minutes`);
+        console.log('\n📈 DATABASE STATISTICS:');
+        console.log(`   👤 Total users: ${stats.user_count}`);
+        console.log(`   🏠 Total rooms: ${stats.room_count}`);
+        console.log(`   📝 Total sessions: ${stats.session_count}`);
+        console.log(`   🔗 Total relationships: ${stats.relationship_count}`);
+        console.log(`   👥 Active participants: ${stats.active_participant_count}`);
+        console.log('━'.repeat(80));
 
-        await new Promise(r => setTimeout(r, config.scraper.interval || 10000));
-        loop();
+        // Wait before next iteration
+        console.log(`\n⏳ Waiting ${config.SCRAPE_INTERVAL / 1000 / 60} minutes until next iteration...`);
+        await this.sleep(config.SCRAPE_INTERVAL);
+
+      } catch (error) {
+        console.error('\n❌ ERROR IN TRACKING LOOP:', error);
+        console.error(error.stack);
+
+        // Wait before retrying
+        console.log('⏳ Waiting 60 seconds before retry...');
+        await this.sleep(60000);
+      }
+    }
+  }
+
+  /**
+   * Scrape homepage for initial user discovery
+   */
+  async scrapeHomepage() {
+    try {
+      console.log('  🌐 Navigating to Free4Talk homepage...');
+
+      await this.page.goto('https://free4talk.com', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+
+      await this.sleep(2000);
+
+      // Get page HTML
+      const html = await this.page.content();
+
+      // Parse homepage
+      const { users, rooms } = parseHomepage(html);
+
+      console.log(`  📊 Parsed: ${users.length} users, ${rooms.length} rooms`);
+
+      // Store basic user info from homepage
+      for (const user of users) {
+        await this.db.upsertUser({
+          username: user.username,
+          displayName: user.displayName,
+          avatarUrl: user.avatarUrl,
+          followerCount: 0,
+          followingCount: 0,
+          friendsCount: 0
+        });
+      }
+
+      // Store rooms from homepage
+      for (const room of rooms) {
+        await this.db.upsertRoom({
+          roomId: room.roomId,
+          roomName: room.roomName,
+          topic: room.topic,
+          language: room.language,
+          isPublic: room.isPublic,
+          participantCount: room.participantCount
+        });
+      }
+
+      return users.map(u => u.username);
+
+    } catch (error) {
+      console.error('  ❌ Error scraping homepage:', error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Helper: Sleep for ms
+   */
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Graceful shutdown
+   */
+  async shutdown() {
+    console.log('\n🛑 Shutting down...');
+
+    if (this.browser) {
+      await this.browser.close();
+      console.log('✅ Browser closed');
     }
 
-    loop();
+    if (this.db) {
+      await this.db.close();
+      console.log('✅ Database connection closed');
+    }
+
+    console.log('👋 Goodbye!');
+    process.exit(0);
+  }
 }
 
-/**
- * Process API data with full extraction
- */
-async function processApiData(apiGroups) {
-    const processedRooms = [];
-    const activeRoomIds = [];
+// Main execution
+(async () => {
+  const scraper = new Free4TalkScraper();
 
-    // Skill level mapping
-    const skillMap = {
-        'Beginner': 'Beginner',
-        'Upper Beginner': 'Beginner',
-        'Intermediate': 'Intermediate',
-        'Upper Intermediate': 'Intermediate',
-        'Advanced': 'Advanced',
-        'Upper Advanced': 'Advanced',
-        'Any Level': 'Any Level'
-    };
+  // Handle shutdown signals
+  process.on('SIGINT', () => scraper.shutdown());
+  process.on('SIGTERM', () => scraper.shutdown());
 
-    for (const [id, group] of Object.entries(apiGroups)) {
-        try {
-            // Extract creator information first
-            let creatorData = null;
-            if (group.creator) {
-                creatorData = {
-                    creator_user_id: group.creator.id || group.userId,
-                    creator_name: group.creator.name,
-                    creator_avatar: group.creator.avatar,
-                    creator_is_verified: group.creator.isVerified || false
-                };
-
-                // Upsert creator as a user
-                await db.upsertUser({
-                    user_id: creatorData.creator_user_id,
-                    username: creatorData.creator_name,
-                    user_avatar: creatorData.creator_avatar,
-                    verification_status: creatorData.creator_is_verified ? 'VERIFIED' : 'UNVERIFIED',
-                    followers_count: group.creator.followers || 0,
-                    following_count: group.creator.following || 0,
-                    friends_count: group.creator.friends || 0,
-                    supporter_level: group.creator.supporter || 0
-                });
-            }
-
-            // Map skill level
-            const cleanSkill = skillMap[group.level] || 'Any Level';
-
-            // Build complete room data
-            const roomData = {
-                room_id: group.id,
-                channel: group.channel || 'free4talk',
-                platform: group.platform || 'Free4Talk',
-                topic: group.topic || 'Anything',
-                language: group.language || 'Unknown',
-                second_language: group.secondLanguage || null,
-                skill_level: cleanSkill,
-                max_capacity: group.maxPeople || -1,
-                allows_unlimited: (group.maxPeople === -1) || false,
-                is_locked: group.settings?.isLocked || false,
-                mic_allowed: !group.settings?.noMic,
-                mic_required: false,
-                al_mic: group.settings?.alMic || 0,
-                no_mic: group.settings?.noMic || false,
-                url: group.url || null,
-                is_active: true,
-                is_full: false,
-                is_empty: !group.clients || group.clients.length === 0,
-                current_users_count: group.clients ? group.clients.length : 0,
-                ...creatorData
-            };
-
-            // Upsert room
-            await db.upsertRoom(roomData);
-            activeRoomIds.push(group.id);
-
-            // Extract participants with full data
-            const participants = (group.clients || []).map((client, index) => ({
-                user_id: client.id,
-                username: client.name,
-                user_avatar: client.avatar || null,
-                followers_count: client.followers || 0,
-                following_count: client.following || 0,
-                friends_count: client.friends || 0,
-                supporter_level: client.supporter || 0,
-                verification_status: client.isVerified ? 'VERIFIED' : 'UNVERIFIED',
-                position: index + 1
-            }));
-
-            // Process room with tracker
-            const { joined, left } = await tracker.processRoom({
-                room_id: group.id,
-                participants: participants
-            });
-
-            if (joined > 0 || left > 0) {
-                console.log(`  📍 ${group.topic} (${group.language}): +${joined} -${left}`);
-            }
-
-            processedRooms.push(group.id);
-
-        } catch (error) {
-            console.error(`❌ Error processing room ${group.id}:`, error.message);
-        }
-    }
-
-    // Mark rooms that are no longer active
-    if (activeRoomIds.length > 0) {
-        const inactiveRooms = await db.markInactiveRooms(activeRoomIds);
-        if (inactiveRooms && inactiveRooms.length > 0) {
-            console.log(`🔴 Marked ${inactiveRooms.length} rooms as inactive`);
-        }
-    }
-
-    console.log(`✅ Processed ${processedRooms.length} rooms`);
-}
-
-// Start the scraper
-startSmartScraper().catch(error => {
-    console.error('💥 Fatal error:', error);
-    process.exit(1);
-});
+  try {
+    await scraper.initialize();
+    await scraper.startTracking();
+  } catch (error) {
+    console.error('\n💥 FATAL ERROR:', error);
+    console.error(error.stack);
+    await scraper.shutdown();
+  }
+})();
