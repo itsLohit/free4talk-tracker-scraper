@@ -1,4 +1,6 @@
 // index.js - FIXED VERSION
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const { chromium } = require('playwright');
 const Database = require('./db');
 const Free4TalkTracker = require('./tracker');
