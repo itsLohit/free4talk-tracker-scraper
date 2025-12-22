@@ -3,23 +3,24 @@ const config = require('./config');
 
 class Database {
   constructor() {
-    // FIXED: Use the DATABASE_URL directly from environment
-    // or use the parsed config.db object
     const DATABASE_URL = process.env.DATABASE_URL;
-
+    
+    console.log('🔍 DATABASE_URL exists:', !!DATABASE_URL); // ADD THIS
+    
     if (DATABASE_URL) {
-        // Use connectionString when DATABASE_URL is available
-        this.pool = new Pool({
-            connectionString: DATABASE_URL,
-            ssl: {
-                rejectUnauthorized: false
-            }
-        });
+      console.log('✅ Using DATABASE_URL with SSL config'); // ADD THIS
+      this.pool = new Pool({
+        connectionString: DATABASE_URL,
+        ssl: {
+          rejectUnauthorized: false
+        }
+      });
     } else {
-        // Use parsed config for local development
-        this.pool = new Pool(config.db);
+      console.log('⚠️ Using config.db (no SSL)'); // ADD THIS
+      this.pool = new Pool(config.db);
     }
-}
+  }
+  
 
 
   async connect() {
