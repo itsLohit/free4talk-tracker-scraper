@@ -1,13 +1,24 @@
-// db.js - FIXED VERSION
 const { Pool } = require('pg');
 const config = require('./config');
 
 class Database {
   constructor() {
-    this.pool = new Pool({
-      connectionString: config.DATABASE_URL,
-      ssl: config.DATABASE_URL.includes('aiven') ? { rejectUnauthorized: false } : false
-    });
+    // FIXED: Use the DATABASE_URL directly from environment
+    // or use the parsed config.db object
+    const DATABASE_URL = process.env.DATABASE_URL;
+    
+    if (DATABASE_URL) {
+      // Use connectionString when DATABASE_URL is available
+      this.pool = new Pool({
+        connectionString: DATABASE_URL,
+        ssl: DATABASE_URL.includes('aiven') || DATABASE_URL.includes('sslmode=require')
+          ? { rejectUnauthorized: false }
+          : false
+      });
+    } else {
+      // Use parsed config for local development
+      this.pool = new Pool(config.db);
+    }
   }
 
   async connect() {
