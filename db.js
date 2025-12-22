@@ -6,20 +6,21 @@ class Database {
     // FIXED: Use the DATABASE_URL directly from environment
     // or use the parsed config.db object
     const DATABASE_URL = process.env.DATABASE_URL;
-    
+
     if (DATABASE_URL) {
-      // Use connectionString when DATABASE_URL is available
-      this.pool = new Pool({
-        connectionString: DATABASE_URL,
-        ssl: DATABASE_URL.includes('aiven') || DATABASE_URL.includes('sslmode=require')
-          ? { rejectUnauthorized: false }
-          : false
-      });
+        // Use connectionString when DATABASE_URL is available
+        this.pool = new Pool({
+            connectionString: DATABASE_URL,
+            ssl: {
+                rejectUnauthorized: false
+            }
+        });
     } else {
-      // Use parsed config for local development
-      this.pool = new Pool(config.db);
+        // Use parsed config for local development
+        this.pool = new Pool(config.db);
     }
-  }
+}
+
 
   async connect() {
     try {
