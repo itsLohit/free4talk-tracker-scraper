@@ -1,5 +1,5 @@
 // index.js - FIXED VERSION
-const puppeteer = require('puppeteer');
+const { chromium } = require('playwright');
 const Database = require('./db');
 const Free4TalkTracker = require('./tracker');
 const { parseHomepage } = require('./parser');
@@ -21,7 +21,7 @@ class Free4TalkScraper {
     await this.db.connect();
 
     // Launch browser
-    this.browser = await puppeteer.launch({
+    const browser = await chromium.launch({
       headless: config.HEADLESS,
       args: [
         '--no-sandbox',
