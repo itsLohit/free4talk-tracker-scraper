@@ -1,7 +1,8 @@
 const db = require('./db');
 
 class SessionTracker {
-    constructor() {
+    constructor(pool) {
+        this.pool = pool; 
         this.activeSessions = new Map(); // user_id -> Set of room_ids
         this.snapshotInterval = 5 * 60 * 1000; // 5 minutes
         this.lastSnapshotTime = new Map(); // room_id -> timestamp
@@ -12,7 +13,7 @@ class SessionTracker {
      */
     async initialize() {
         // Get ALL active sessions, not just from one room
-        const result = await db.pool.query(
+        const result = await this.pool.query(
             'SELECT session_id, user_id, room_id FROM sessions WHERE is_currently_active = true'
         );
 

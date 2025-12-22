@@ -3,7 +3,9 @@ const db = require('./db');
 const SessionTracker = require('./tracker');
 const config = require('./config');
 
-const tracker = new SessionTracker();
+const tracker = new SessionTracker(db.pool);
+
+
 
 async function startSmartScraper() {
     console.log('🚀 Starting Smart Network Interceptor...');
